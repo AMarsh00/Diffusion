@@ -412,8 +412,8 @@ def main():
     image_path_A = "/data5/accounts/marsh/Diffusion/celeba_hq_prepared/000100.png"
 
     x0_A = load_image(image_path_A).to(device)
-    xA = torch.randn_like(x0_A)
-    xB = torch.randn_like(x0_A)
+    xA_ = torch.randn_like(x0_A)
+    xB_ = torch.randn_like(x0_A)
 
     model = UNetSD().to(device)
     scheduler = VPScheduler(num_timesteps=1000)
@@ -426,8 +426,8 @@ def main():
         print("Checkpoint not found. Using random weights.")
     model.eval()
     
-    xA = Phi(xA, model, scheduler, num_steps=1000)
-    xB = Phi(xB, model, scheduler, num_steps=1000)
+    xA = Phi(xA_, model, scheduler, num_steps=1000)
+    xB = Phi(xB_, model, scheduler, num_steps=1000)
 
     # 1?Initialize the dataset
     train_dataset = CelebAHQDataset(root_dir="/data5/accounts/marsh/Diffusion/celeba_hq_prepared", image_size=64)
@@ -449,19 +449,20 @@ def main():
     print(f"Loaded {train_dataset_tensors.shape[0]} images into tensor")
     
     # 3. Choose diffusion timestep for metric
-    t_idx = 400#999
+    t_idx = 30#999
 
     # 4. Compute geodesics for multiple beta values
-    beta_values = [0]#[-0.5, -0.25, 0, 0.25]
+    beta_values = [-0.5, -0.25, 0, 0.25]
     n_geo_steps = 10
     all_geodesics = {}
+    lam = 10000.0
 
     for beta in beta_values:
         print(f"Computing log map for beta={beta}...")
         v = log_map_shooting(
             y=xA, y_target=xB,
             model=model, scheduler=scheduler,
-            t_idx=t_idx, lam=10000.0, beta=beta,
+            t_idx=t_idx, lam=lam, beta=beta,
             max_iters=2000, lr=1e-1,
             train_images=train_dataset_tensors
         )
@@ -474,7 +475,7 @@ def main():
                 xA, s * v,
                 model=model, scheduler=scheduler,
                 t_idx=t_idx, train_images=train_dataset_tensors,
-                lam=1000.0, beta=beta,
+                lam=lam, beta=beta,
             )
             x0_pred = ddim_sample(
                 model, scheduler, y_s,
@@ -488,8 +489,9 @@ def main():
     linear_interp = []
     for i in range(n_geo_steps):
         s = i / (n_geo_steps - 1)
-        y_s = (1 - s) * xA + s * xB
-        linear_interp.append(y_s.detach().cpu())
+        y_s = (1 - s) * xA_ + s * xB_
+        x_s = ddim_sample(model, scheduler, y_s, torch.linspace(999, 0, 1000, dtype=torch.long, device=device))
+        linear_interp.append(x_s.detach().cpu())
 
     # 6. Plot all results
     from PIL import ImageDraw, ImageFont
