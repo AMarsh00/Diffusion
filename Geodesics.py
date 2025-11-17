@@ -325,12 +325,12 @@ def log_map_shooting(y, y_target, model, scheduler, t_idx,
     y = y.detach()
     y_target = y_target.detach()
     tol = 1e-4
-    momentum_gamma = 0.9
+    #momentum_gamma = 0.9
     
     v = (y_target - y).detach().clone()
     v.requires_grad_(True)
     
-    momentum = torch.zeros_like(v)
+    #momentum = torch.zeros_like(v)
     best_v = v.clone()
     best_loss = float('inf')
 
@@ -353,8 +353,8 @@ def log_map_shooting(y, y_target, model, scheduler, t_idx,
             step = lr * residual / (residual.norm() + 1e-8)
 
             # apply momentum
-            momentum = momentum_gamma * momentum + step
-            v = v + momentum
+            #momentum = momentum_gamma * momentum + step
+            v = v + step#momentum
 
             # track best v only at the **max substeps stage**
             if n_substeps == n_substeps_schedule[-1] and loss.item() < best_loss:
@@ -452,7 +452,7 @@ def main():
     t_idx = 30#999
 
     # 4. Compute geodesics for multiple beta values
-    beta_values = [-0.5, -0.25, 0, 0.25]
+    beta_values = [0]#[-0.5, -0.25, 0, 0.25]
     n_geo_steps = 10
     all_geodesics = {}
     lam = 10000.0
