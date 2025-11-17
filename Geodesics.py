@@ -449,10 +449,10 @@ def main():
     print(f"Loaded {train_dataset_tensors.shape[0]} images into tensor")
     
     # 3. Choose diffusion timestep for metric
-    t_idx = 30#999
+    t_idx = 400#999
 
     # 4. Compute geodesics for multiple beta values
-    beta_values = [-0.5, -0.25, 0, 0.25]
+    beta_values = [0]#[-0.5, -0.25, 0, 0.25]
     n_geo_steps = 10
     all_geodesics = {}
 
@@ -461,8 +461,8 @@ def main():
         v = log_map_shooting(
             y=xA, y_target=xB,
             model=model, scheduler=scheduler,
-            t_idx=t_idx, lam=1000.0, beta=beta,
-            max_iters=1000, lr=1e-1,
+            t_idx=t_idx, lam=10000.0, beta=beta,
+            max_iters=2000, lr=1e-1,
             train_images=train_dataset_tensors
         )
         print(f"Log map complete for beta={beta}.")
@@ -478,7 +478,7 @@ def main():
             )
             x0_pred = ddim_sample(
                 model, scheduler, y_s,
-                torch.linspace(29, 0, 30, dtype=torch.long, device=device)
+                torch.linspace(t_idx-1, 0, t_idx, dtype=torch.long, device=device)
             )
             geodesic.append(x0_pred.detach().cpu())
         all_geodesics[beta] = geodesic
