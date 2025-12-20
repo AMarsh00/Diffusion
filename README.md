@@ -1,3 +1,8 @@
 TODO: WRITE THIS AND MAKE PRETTY!!
 
 UPDATE ALL CODES TO FINAL FROM RACECAR THEN EDIT THEM TO MAKE THEM LOOK NICER
+
+FILES ON RACECAR I NEED IN HERE (and prettified):
+Diffusion/Publication/Geodesics.py
+
+Add more as needed
