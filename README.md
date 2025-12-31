@@ -12,5 +12,6 @@ Model training code potentially/model weights potentially
 From my computer:
 graphic.py in python 3.13 I **think**
 graphic2.py
+graphic3.py
 
 Add more as needed
