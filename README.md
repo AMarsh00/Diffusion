@@ -22,8 +22,8 @@ This repository implements the **confidence metric for diffusion models**, as de
 
 - **Confidence metric & high-confidence curves**
   - `Confidence.py`: Core implementation of the confidence metric.
-  - `High_Confidence_Curves.py`: Generates high-confidence latent curves.
-  - `ConfChains.py`: Computes chains of high-confidence points for latent traversals.
+  - `High_Confidence_Curves.py`: Generates high-confidence curve interpolations.
+  - `ConfChains.py`: Computes chains of expected primitive confidence optimization updates.
 
 ---
 
