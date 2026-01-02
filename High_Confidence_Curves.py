@@ -10,14 +10,13 @@ import os
 import math
 import torch
 import torch.nn as nn
-from torchvision import transforms
-from PIL import Image
+import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from scipy.stats import norm
-import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageDraw, ImageFont
+from torchvision import transforms
 
 # ------------------------
 # UNetSD Components
@@ -183,6 +182,7 @@ def ddim_sample(model, scheduler, x_T, timesteps, eta=0.0):
 
 # ------------------------
 # Stein Score / Riemannian metric
+# ------------------------
 def score_fn(x, model, scheduler, t):
     """
     Computes the Stein score s_theta(x, t) = grad_x log p_t(x)
