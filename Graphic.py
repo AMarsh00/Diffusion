@@ -1,3 +1,11 @@
+"""
+Graphic.py
+Alexander Marsh
+2 January 2026
+
+Displays geodesics with our metric in the simple Gaussian case for various values of theta
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -9,9 +17,9 @@ def gaussian_2d(x):
     return (1/(2*np.pi)) * np.exp(-0.5*np.sum(x**2, axis=-1))
 
 # -----------------------------
-# Metric g(x) = e^{theta (log p(x) - log p_ind(x))} * (I + lam s s^T)
+# Metric g(x) = I + e^{theta (log p(x) - log p_ind(x))} * s s^T
 # -----------------------------
-def g_metric(x, lam=1e6, theta=0.0):
+def g_metric(x, theta=0.0):
     """Compute the metric g(x) based on Gaussian distribution"""
     eps = 1e-300
     p_sharp = np.maximum(gaussian_2d(x), eps)
@@ -25,7 +33,6 @@ def g_metric(x, lam=1e6, theta=0.0):
 
     # The metric is a scaled identity matrix with an additional term
     g = np.eye(2)+weight*np.outer(s,s)
-    #g=weight * (np.eye(2) + lam * np.outer(s, s))
     return g
 
 # -----------------------------
@@ -130,9 +137,7 @@ plt.figure(figsize=(8,6))
 plt.contourf(X, Y, Z, levels=30, cmap='viridis')
 
 theta_values = [-5, -2.5, -1, -0.5, 0, 0.5, 1, 2.5, 5]  # Exploring different theta values
-#lam_values = [0, 1, 10, 100, 1000, 10000, 100000]
 n_steps = 10  # Number of geodesic steps
-lam = 1e4
 
 colors = [
     'red', 'blue', 'orange', 'magenta', 'cyan', 'green', 'purple', 'yellow', 'pink', 'brown',
@@ -144,7 +149,6 @@ colors = [
     'darkslateblue', 'mediumturquoise', 'lightskyblue', 'lightgoldenrodyellow', 'mediumorchid',
     'steelblue', 'darkred', 'darksalmon', 'lightseagreen', 'wheat', 'midnightblue', 'lightblue'
 ]
-#theta=0
 for theta, color in zip(theta_values, colors):
     # Compute the Riemannian logarithm with scaling
         
@@ -152,8 +156,8 @@ for theta, color in zip(theta_values, colors):
     geo = [start]
     for i in range(1, n_steps):
         # Recompute the logarithm after each step
-        v_new = riemannian_logarithm(geo[-1], end, n_steps, lam=lam, theta=theta, eta=1e-3, n_max_iter=1000)
-        geo.append(riemannian_exponential(geo[-1], v_new*i/n_steps, n_steps, lam, theta=theta))
+        v_new = riemannian_logarithm(geo[-1], end, n_steps, theta=theta, eta=1e-3, n_max_iter=1000)
+        geo.append(riemannian_exponential(geo[-1], v_new*i/n_steps, n_steps, theta=theta))
     geo.append(end)
     
     geo = np.array(geo)
@@ -167,3 +171,4 @@ plt.ylabel('y')
 plt.colorbar(label='Gaussian density')
 plt.legend()
 plt.show()
+
