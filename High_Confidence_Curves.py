@@ -440,9 +440,6 @@ def confidence_metric(
 ):
     device = z.device
 
-    # -------------------------
-    # 1. Construct e-ball in latent space and map to image space
-    # -------------------------
     def sample_ball(z0, eps, N):
         shape = z0.shape
         d = z0.numel() // z0.shape[0]  # flattened dimension per sample
