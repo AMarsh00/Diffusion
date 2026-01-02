@@ -6,7 +6,7 @@ FILES ON RACECAR I NEED IN HERE (and prettified):
 Diffusion/Publication/Geodesics.py
 Diffusion/Publication/Confidence.py
 Diffusion/Publication/ConfChains.py
-Diffusion/Publication/HighConfidenceCurves.py
+Diffusion/Publication/HC_Curves_Fast.py
 
 Model training code potentially/model weights potentially
 
