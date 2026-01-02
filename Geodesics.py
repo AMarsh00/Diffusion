@@ -10,12 +10,12 @@ import os
 import math
 import torch
 import torch.nn as nn
-from torchvision import transforms
-from PIL import Image
+import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
 from scipy.stats import norm
-import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 # ------------------------
