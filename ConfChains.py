@@ -182,6 +182,7 @@ def ddim_sample(model, scheduler, x_T, timesteps, eta=0.0):
 
 # ------------------------
 # Stein Score / Riemannian metric
+# ------------------------
 def score_fn(x, model, scheduler, t):
     """
     Computes the Stein score s_theta(x, t) = grad_x log p_t(x)
