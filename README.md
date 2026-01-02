@@ -17,7 +17,7 @@ This repository implements the **confidence metric for diffusion models**, as de
 - **Pre-trained model**
   - `unet_epoch_2000.pt`: Pre-trained weights for the 64x64 CelebA-HQ model. Can be downloaded to avoid retraining.
 
-- **Example experiments (paper figures)**
+- **Example experiments**
   - `Graphic.py`, `Graphic2.py`, `Graphic3.py`: Scripts for reproducing Gaussian-based experiments from the paper.
 
 - **Confidence metric & high-confidence curves**
