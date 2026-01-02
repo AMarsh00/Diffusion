@@ -454,9 +454,6 @@ def confidence_metric(
 ):
     device = z.device
 
-    # -------------------------
-    # 1. Construct e-ball in latent space and map to image space
-    # -------------------------
     def sample_ball(z0, eps, N):
         shape = z0.shape
         d = z0.numel() // z0.shape[0]  # flattened dimension per sample
@@ -472,14 +469,8 @@ def confidence_metric(
 
     Z = sample_ball(z, eps, N)# FUNDAMENTAL BUG
     
-    # -------------------------
-    # 3. Compute expected primitive
-    # -------------------------
     y_star = expected_primitive(z0=z, Z=Z, Phi_fn=Phi_fn, log_map_fn=log_map_fn, exp_map_fn=exp_map_fn, eps=eps, max_iter=max_iter, lr=lr)
 
-    # -------------------------
-    # 4. Compute geodesic distances
-    # -------------------------
     geodesic_dists = []
     for i in range(N):
         log_i = log_map_fn(y_star, Z[i:i+1])
@@ -491,17 +482,11 @@ def confidence_metric(
     log_center = log_map_fn(Phi_fn(y_star), Phi_fn(z))
     dist_center = (log_center**2).sum().item()
 
-    # -------------------------
-    # 5. Compute weighted Riemannian variance
-    # -------------------------
     z_star_norm = (y_star**2).sum()
     Z_norm = (Z**2).view(N, -1).sum(dim=1)
     weights = torch.exp(0.5 * (z_star_norm - Z_norm))
     var_R = (weights * geodesic_dists).mean().item()
 
-    # -------------------------
-    # 6. Compute confidence metric
-    # -------------------------
     C = torch.log(torch.tensor(var_R)) + dist_center**2 / (var_R+1e-5)
 
     return C.item(), var_R, dist_center
