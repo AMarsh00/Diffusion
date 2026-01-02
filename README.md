@@ -6,4 +6,4 @@ FILES ON RACECAR I NEED IN HERE (and prettified):
 Diffusion/Publication/ConfChains.py
 Diffusion/Publication/HC_Curves_Fast.py
 
-Model training code potentially/model weights potentially
+Model weights potentially
