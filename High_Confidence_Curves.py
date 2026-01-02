@@ -644,7 +644,7 @@ def main():
     # Endpoints
     # -------------------------
     z_start = torch.randn(1, 3, 64, 64, device=device)
-    z_end   = z_start + 0.7 * torch.randn_like(z_start)
+    z_end   = torch.randn(1, 3, 64, 64, device=device)
 
     # -------------------------
     # Initial geodesic
