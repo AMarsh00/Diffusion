@@ -205,10 +205,7 @@ def score_fn(x, model, scheduler, t):
     return score
 
 # ------------------------
-# Log map on image space (Euclidean approx)
-# ------------------------
-# ------------------------
-# Linear path integral
+# Find nearest training point (for x_ind in the path integral later)
 # ------------------------
 def find_nearest_training_point(y, train_images):
     """
@@ -230,6 +227,9 @@ def find_nearest_training_point(y, train_images):
 
     return torch.stack(nearest, dim=0)  # [B, C, H, W]
     
+# ------------------------
+# Compute path integral
+# ------------------------
 @torch.no_grad()
 def linear_path_integral_fast(y, y_target, model, scheduler, t_idx, n_steps=16):
     # y, y_target: [B, C, H, W]
@@ -263,11 +263,10 @@ def linear_path_integral_fast(y, y_target, model, scheduler, t_idx, n_steps=16):
     return phi
 
 # ------------------------
-# Exponential map with new metric
+# Exponential map with our metric
 # ------------------------
 @torch.no_grad()
-def exp_map(y, v, model, scheduler, t_idx, train_images=None,
-                      lam=1000.0, beta=0.0, n_substeps=8, correct_every=1):
+def exp_map(y, v, model, scheduler, t_idx, train_images=None, beta=0.0, n_substeps=8, correct_every=1):
     """
     Exponential map along tangent vector `v` with score correction using the diffusion model.
 
@@ -278,7 +277,7 @@ def exp_map(y, v, model, scheduler, t_idx, train_images=None,
     - scheduler: VPScheduler
     - t_idx: diffusion timestep
     - train_images: optional dataset for nearest neighbor
-    - lam, beta: Riemannian metric parameters
+    - beta: Riemannian metric parameters
     - n_substeps: number of substeps
     - correct_every: how often to apply diffusion-based correction
     """
@@ -298,8 +297,6 @@ def exp_map(y, v, model, scheduler, t_idx, train_images=None,
     
             # Path integral factor
             Phi_val = linear_path_integral_fast(y_current, y_target, model, scheduler, t_idx)  # [B]
-            #print(Phi_val)
-            #Phi_val = torch.clamp(Phi_val, -1, 1)
             C = torch.exp(beta * Phi_val).view(-1, 1, 1, 1)  # broadcast
         else:
             C = 1
@@ -308,39 +305,24 @@ def exp_map(y, v, model, scheduler, t_idx, train_images=None,
         s_norm2 = (s * s).view(s.shape[0], -1).sum(dim=1, keepdim=True)  # [B,1]
         proj = (s * dx).view(s.shape[0], -1).sum(dim=1, keepdim=True)    # [B,1]
         denom = 1 + C * s_norm2
-        ginv_dx = dx - C * (proj / denom).view(-1,1,1,1) * s# * (dx.norm() / (s * s).norm())
-        y_current = y_current + ginv_dx#C * ginv_dx
+        ginv_dx = dx - C * (proj / denom).view(-1,1,1,1) * s
+        y_current = y_current + ginv_dx
 
-        """# Diffusion-based correction (optional)
-        if (step + 1) % correct_every == 0:
-            t_tensor = torch.tensor([t_idx], device=y_current.device)
-            eps = model(y_current, t_tensor)
-            alpha_bar = scheduler.alphas_cumprod[t_idx]
-            x0_pred = (y_current - eps * torch.sqrt(1 - alpha_bar)) / torch.sqrt(alpha_bar)
-            y_current = torch.sqrt(alpha_bar) * x0_pred + eps * torch.sqrt(1 - alpha_bar)"""
-    """if torch.norm(v) > 0.1:
-        displacement = y_current - y
-        scale = torch.norm(v) / torch.norm(displacement)
-        y_current = y + scale * displacement"""
     return y_current
     
 # ------------------------
-# Log map shooting with new metric
+# Log map shooting with our metric
 # ------------------------
 @torch.no_grad()
-def log_map_shooting(y, y_target, model, scheduler, t_idx,
-                     lam=1000.0, beta=0.0, max_iters=1000, lr=0.1,
-                     n_substeps_schedule=[1,2,4,8], train_images=None):
+def log_map_shooting(y, y_target, model, scheduler, t_idx, beta=0.0, max_iters=1000, lr=0.1, n_substeps_schedule=[1,2,4,8], train_images=None):
     z=torch.norm(y-y_target)
     y = y.detach().clone()
     y_target = y_target.detach().clone()
     tol = 1e-1
     momentum_gamma = 0.9
-    #print(torch.norm(y-y_target))
     
     v = (y_target - y).detach().clone()
     v.requires_grad_(True)
-    #print(torch.norm(v))
     
     momentum = torch.zeros_like(v)
     best_v = v.clone()
@@ -349,24 +331,15 @@ def log_map_shooting(y, y_target, model, scheduler, t_idx,
     for idx, n_substeps in enumerate(n_substeps_schedule):
         n_iters = max_iters // len(n_substeps_schedule)
         V = best_v
-        #print(torch.norm(y-y_target))
         for i in range(n_iters):
-            #print(torch.norm(y-y_target))
-            y_pred = exp_map(y.detach().clone(), v.detach().clone(), model, scheduler, t_idx,
-                             lam=lam, beta=beta, n_substeps=n_substeps,
-                             train_images=train_images)
+            y_pred = exp_map(y.detach().clone(), v.detach().clone(), model, scheduler, t_idx, beta=beta, n_substeps=n_substeps, train_images=train_images)
             residual = y_target - y_pred
 
             loss = residual.norm()**2
-            #print(torch.norm(y-y_target))
-            #print(z)
-            #print(f"n_substeps={n_substeps}, iter={i}, loss={loss.item():.6f}")
             
             if loss.item() < tol:
-                #print('b')
                 break
             
-            #quick_exit(0)
             # normalize residual to prevent huge jumps
             step = lr * residual / (residual.norm() + 1e-8)
 
@@ -381,49 +354,6 @@ def log_map_shooting(y, y_target, model, scheduler, t_idx,
 
     return best_v
 
-    """# detach inputs
-    y = y.detach()
-    y_target = y_target.detach()
-
-    # initial tangent guess
-    v = 0*(y_target - y).detach().clone().requires_grad_(True)
-
-    for it in range(max_iters):
-
-        # ---- 1. Forward: compute predicted endpoint ----
-        y_pred = exp_map(
-            y, v,
-            model=model, scheduler=scheduler,
-            t_idx=t_idx,
-            lam=lam, beta=beta,
-            n_substeps=n_substeps
-        )
-
-        # ---- 2. Compute loss ----
-        residual = y_pred - y_target
-        loss = 0.5 * residual.pow(2).sum()
-
-        print(f"[adjoint] iter={it}   loss={loss.item():.6f}")
-
-        if loss.item() < 1e-5:
-            break
-
-        # ---- 3. Backprop to get adjoint gradient: J^T r ----
-        loss.backward()
-
-        # ---- 4. Gradient update ----
-        with torch.no_grad():
-            grad = v.grad.clone()
-            v -= lr * grad
-
-            # Optional: damp explosion
-            if v.norm() > 5.0:
-                v *= 5.0 / v.norm()
-
-        v.grad.zero_()
-
-    return v.detach()"""
-
 # ------------------------
 # Image helpers
 # ------------------------
@@ -436,7 +366,6 @@ def load_image(path, image_size=64):
     img = Image.open(path).convert("RGB")
     return transform(img).unsqueeze(0)
 
-#@torch.no_grad()
 def Phi(y, model, scheduler, num_steps=50, eta=0.0, t_idx=0):
     """
     Map noise y -> image x using DDIM deterministic sampling.
@@ -467,15 +396,15 @@ class CelebAHQDataset(Dataset):
     def __getitem__(self, idx):
         image = Image.open(self.image_paths[idx]).convert("RGB")
         return self.transform(image)
-
+        
+# ------------------------
+# Compute expected primitive
+# ------------------------
 @torch.no_grad()
-def expected_primitive(
-    z0, Z, Phi_fn, log_map_fn, exp_map_fn, eps,
-    max_iter=200, lr=0.01
-):
+def expected_primitive(z0, Z, Phi_fn, log_map_fn, exp_map_fn, eps,max_iter=200, lr=0.01):
     z_t = z0.clone()
 
-    # 🔥 CACHE Phi(Z) ONCE
+    # Cache Phi_Z once
     Phi_Z = Phi_fn(Z)   # [N, C, H, W]
     Zi_norm2 = (Z**2).view(Z.shape[0], -1).sum(dim=1)
 
@@ -527,16 +456,8 @@ def confidence_metric(
         # Reshape back and add to z0
         return z0 + u.view(N, *shape[1:])
 
-    Z = sample_ball(z, eps, N)# FUNDAMENTAL BUG
+    Z = sample_ball(z, eps, N)
     
-    # -------------------------
-    # 2. Map samples to region R
-    # -------------------------
-    #Y = Phi_fn(Z)   # [N,C,H,W] or [N,C,...]
-    
-    # -------------------------
-    # 3. Compute expected primitive
-    # -------------------------
     y_star = expected_primitive(
         z0=z,
         Z=Z,
@@ -548,9 +469,6 @@ def confidence_metric(
         lr=lr
     )
 
-    # -------------------------
-    # 4. Compute geodesic distances
-    # -------------------------
     geodesic_dists = []
     for i in range(N):
         log_i = log_map_fn(y_star, Z[i:i+1])
@@ -562,37 +480,20 @@ def confidence_metric(
     log_center = log_map_fn(Phi_fn(y_star), Phi_fn(z))
     dist_center = (log_center**2).sum().item()
 
-    # -------------------------
-    # 5. Compute weighted Riemannian variance
-    # -------------------------
     z_star_norm = (y_star**2).sum()
     Z_norm = (Z**2).view(N, -1).sum(dim=1)
     weights = torch.exp(0.5 * (z_star_norm - Z_norm))
     var_R = (weights * geodesic_dists).mean().item()
 
-    # -------------------------
-    # 6. Compute confidence metric
-    # -------------------------
     C = torch.log(torch.tensor(var_R)) + dist_center**2 / (var_R+1e-5)
 
     return C.item(), var_R, dist_center
 
-import torch
-import matplotlib.pyplot as plt
-from torchvision import transforms
-import numpy as np
-
 # ============================================================
-# Geodesic curve in latent space (USING YOUR LOG/EXP MAP)
+# Geodesic curve in latent space
 # ============================================================
 @torch.no_grad()
-def geodesic_curve_latent(
-    z0,
-    z1,
-    L,
-    log_map_fn,
-    exp_map_fn
-):
+def geodesic_curve_latent(z0, z1, L, log_map_fn, exp_map_fn):
     """
     z0, z1: [1,C,H,W]
     returns: [L+1,C,H,W]
@@ -606,21 +507,11 @@ def geodesic_curve_latent(
 
     return torch.cat(curve, dim=0)
 
-
 # ============================================================
-# High-confidence curve refinement (MAIN ALGORITHM)
+# High-confidence curve refinement
 # ============================================================
 @torch.no_grad()
-def refine_high_confidence_curve(
-    curve,
-    Phi_fn,
-    log_map_fn,
-    exp_map_fn,
-    eps=0.5,
-    n_iters=5,
-    n_candidates=8,
-    conf_kwargs={}
-):
+def refine_high_confidence_curve(curve, Phi_fn, log_map_fn, exp_map_fn, eps=0.5, n_iters=5, n_candidates=8, conf_kwargs={}):
     """
     curve: [L+1,C,H,W]
     """
@@ -662,7 +553,6 @@ def refine_high_confidence_curve(
 
     return curves
 
-
 # ============================================================
 # Visualization helper
 # ============================================================
@@ -671,9 +561,7 @@ def plot_curve_images(curves, Phi_fn, title="High-Confidence Curve"):
     n_curves = len(curves)
     L = curves[0].shape[0]
 
-    fig, axes = plt.subplots(
-        n_curves, L, figsize=(1.8 * L, 1.8 * n_curves)
-    )
+    fig, axes = plt.subplots(n_curves, L, figsize=(1.8 * L, 1.8 * n_curves))
 
     if n_curves == 1:
         axes = axes[None, :]
@@ -683,9 +571,7 @@ def plot_curve_images(curves, Phi_fn, title="High-Confidence Curve"):
         imgs = (imgs * 0.5 + 0.5).clamp(0, 1)
 
         for j in range(L):
-            axes[i, j].imshow(
-                transforms.ToPILImage()(imgs[j].cpu())
-            )
+            axes[i, j].imshow(transforms.ToPILImage()(imgs[j].cpu()))
             axes[i, j].axis("off")
             if i == 0:
                 axes[i, j].set_title(f"s={j}")
@@ -699,7 +585,7 @@ def plot_curve_images(curves, Phi_fn, title="High-Confidence Curve"):
 # MAIN
 # ============================================================
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"#"cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # -------------------------
     # Load model & scheduler
@@ -715,7 +601,6 @@ def main():
     # Diffusion settings
     # -------------------------
     t_idx = 400
-    lam = 0.0
     beta = -10.0
 
     ddim_timesteps = torch.linspace(
@@ -744,7 +629,6 @@ def main():
             model=model,
             scheduler=scheduler,
             t_idx=t_idx,
-            lam=lam,
             beta=beta,
             max_iters=200,
         )
@@ -756,7 +640,6 @@ def main():
             model=model,
             scheduler=scheduler,
             t_idx=t_idx,
-            lam=lam,
             beta=beta,
         )
 
@@ -770,13 +653,7 @@ def main():
     # Initial geodesic
     # -------------------------
     L = 5
-    init_curve = geodesic_curve_latent(
-        z_start,
-        z_end,
-        L=L,
-        log_map_fn=log_map_fn,
-        exp_map_fn=exp_map_fn
-    )
+    init_curve = geodesic_curve_latent(z_start, z_end, L=L, log_map_fn=log_map_fn, exp_map_fn=exp_map_fn)
 
     # -------------------------
     # High-confidence refinement
@@ -800,10 +677,7 @@ def main():
     # -------------------------
     # Visualize
     # -------------------------
-    plot_curve_images(curves, Phi_fn,
-        title="High-Confidence Curve Refinement (Diffusion)"
-    )
-
+    plot_curve_images(curves, Phi_fn, title="High-Confidence Curve Refinement (Diffusion)")
 
 if __name__ == "__main__":
     main()
