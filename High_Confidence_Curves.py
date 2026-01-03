@@ -1,7 +1,7 @@
 """
 High_Confidence_Curves.py
 Alexander Marsh
-2 January 2026
+3 January 2026
 
 Computes a high-confidence curve interpolation between two random generations from the CelebA-HQ model.
 """
@@ -10,9 +10,9 @@ import os
 import math
 import torch
 import torch.nn as nn
-import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import numpy as np
 from scipy.stats import norm
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageDraw, ImageFont
@@ -156,7 +156,6 @@ class VPScheduler:
 # ------------------------
 # DDIM deterministic sampling
 # ------------------------
-#@torch.no_grad()
 def ddim_sample(model, scheduler, x_T, timesteps, eta=0.0):
     x_t = x_T
     device = x_t.device
@@ -205,7 +204,7 @@ def score_fn(x, model, scheduler, t):
     return score
 
 # ------------------------
-# Find nearest training point (for x_ind in the path integral later)
+# Find nearest training point (x_ind in the path integral later)
 # ------------------------
 def find_nearest_training_point(y, train_images):
     """
@@ -226,10 +225,10 @@ def find_nearest_training_point(y, train_images):
         nearest.append(train_images[idx])
 
     return torch.stack(nearest, dim=0)  # [B, C, H, W]
-    
-# ------------------------
+
+# ============================================================
 # Compute path integral
-# ------------------------
+# ============================================================
 @torch.no_grad()
 def linear_path_integral_fast(y, y_target, model, scheduler, t_idx, n_steps=16):
     # y, y_target: [B, C, H, W]
@@ -306,7 +305,7 @@ def exp_map(y, v, model, scheduler, t_idx, train_images=None, beta=0.0, n_subste
         proj = (s * dx).view(s.shape[0], -1).sum(dim=1, keepdim=True)    # [B,1]
         denom = 1 + C * s_norm2
         ginv_dx = dx - C * (proj / denom).view(-1,1,1,1) * s
-        y_current = y_current + ginv_dx
+        y_current = y_current + ginv_dx#C * ginv_dx
 
     return y_current
     
@@ -396,15 +395,15 @@ class CelebAHQDataset(Dataset):
     def __getitem__(self, idx):
         image = Image.open(self.image_paths[idx]).convert("RGB")
         return self.transform(image)
-        
-# ------------------------
-# Compute expected primitive
-# ------------------------
+
+# ============================================================
+# Expected primitive computation
+# ============================================================
 @torch.no_grad()
-def expected_primitive(z0, Z, Phi_fn, log_map_fn, exp_map_fn, eps,max_iter=200, lr=0.01):
+def expected_primitive(z0, Z, Phi_fn, log_map_fn, exp_map_fn, eps, max_iter=200, lr=0.01):
     z_t = z0.clone()
 
-    # Cache Phi_Z once
+    # CACHE Phi(Z) ONCE
     Phi_Z = Phi_fn(Z)   # [N, C, H, W]
     Zi_norm2 = (Z**2).view(Z.shape[0], -1).sum(dim=1)
 
@@ -428,6 +427,9 @@ def expected_primitive(z0, Z, Phi_fn, log_map_fn, exp_map_fn, eps,max_iter=200, 
 
     return z_t
 
+# ============================================================
+# Confidence metric computation
+# ============================================================
 def confidence_metric(
     z: torch.Tensor,            # latent space point x
     Phi_fn,                      # diffusion model: latent -> image space
@@ -455,20 +457,11 @@ def confidence_metric(
 
     Z = sample_ball(z, eps, N)
     
-    y_star = expected_primitive(
-        z0=z,
-        Z=Z,
-        Phi_fn=Phi_fn,
-        log_map_fn=log_map_fn,
-        exp_map_fn=exp_map_fn,
-        eps=eps,
-        max_iter=max_iter,
-        lr=lr
-    )
-
+    y_star = expected_primitive(z0=z, Z=Z, Phi_fn=Phi_fn, log_map_fn=log_map_fn, exp_map_fn=exp_map_fn, eps=eps, max_iter=max_iter, lr=lr)
+    
     geodesic_dists = []
     for i in range(N):
-        log_i = log_map_fn(y_star, Z[i:i+1])
+        log_i = log_map_fn(Phi_fn(y_star), Phi_fn(Z[i:i+1]))
         dist_i = (log_i**2).sum().item()
         geodesic_dists.append(dist_i)
     geodesic_dists = torch.tensor(geodesic_dists, device=device)
@@ -495,12 +488,11 @@ def geodesic_curve_latent(z0, z1, L, log_map_fn, exp_map_fn):
     z0, z1: [1,C,H,W]
     returns: [L+1,C,H,W]
     """
-    v = log_map_fn(z0, z1)
     curve = []
-
-    ts = torch.linspace(0, 1, L + 1, device=z0.device)
-    for t in ts:
-        curve.append(exp_map_fn(z0, t * v))
+    for i in range(L):
+        s = i / (L - 1)
+        y_s = (1 - s) * z0 + s * z1
+        curve.append(y_s)
 
     return torch.cat(curve, dim=0)
 
@@ -522,28 +514,9 @@ def refine_high_confidence_curve(curve, Phi_fn, log_map_fn, exp_map_fn, eps=0.5,
             z0 = curve[i:i+1]
 
             # local latent neighborhood
-            candidates = z0 + eps * torch.randn(
-                n_candidates,
-                *z0.shape[1:],
-                device=z0.device
-            )
-
-            costs = torch.zeros(n_candidates, device=z0.device)
+            candidates = z0 + eps * torch.randn(n_candidates, *z0.shape[1:], device=z0.device)
             
-            for j in range(n_candidates):
-                costs[j], _, _ = confidence_metric(
-                    candidates[j:j+1],
-                    Phi_fn=Phi_fn,
-                    log_map_fn=log_map_fn,
-                    exp_map_fn=exp_map_fn,
-                    **conf_kwargs
-                )
-
-            costs = torch.tensor(costs)
-            best_idx = costs.argmin()
-            new_curve[i] = candidates[best_idx]
-
-            print(f"  point {i}: best C = {costs[best_idx]:.4f}")
+            new_curve[i] = expected_primitive(z0, candidates, Phi_fn, log_map_fn, exp_map_fn, eps)
 
         curve = new_curve
         curves.append(curve.clone())
@@ -576,7 +549,6 @@ def plot_curve_images(curves, Phi_fn, title="High-Confidence Curve"):
     plt.suptitle(title)
     plt.tight_layout()
     plt.savefig("HC_Curves.png")
-    #plt.show()
 
 # ============================================================
 # MAIN
@@ -590,7 +562,7 @@ def main():
     model = UNetSD().to(device)
     scheduler = VPScheduler(num_timesteps=1000)
 
-    checkpoint_path = "/data5/accounts/marsh/Diffusion/vp_diffusion_outputs/unet_epoch_2000.pt"
+    checkpoint_path = "/data5/accounts/marsh/Diffusion/vp_diffusion_outputs/unet_epoch_2000.pt" # Replace with your path
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model = model.to(device).eval()
 
@@ -600,13 +572,7 @@ def main():
     t_idx = 400
     beta = -10.0
 
-    ddim_timesteps = torch.linspace(
-        scheduler.num_timesteps - t_idx - 1,
-        0,
-        scheduler.num_timesteps - t_idx,
-        dtype=torch.long,
-        device=device
-    )
+    ddim_timesteps = torch.linspace(999, 0, 1000, dtype=torch.long, device=device)
     
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
 
@@ -644,8 +610,8 @@ def main():
     # Endpoints
     # -------------------------
     z_start = torch.randn(1, 3, 64, 64, device=device)
-    z_end   = torch.randn(1, 3, 64, 64, device=device)
-
+    z_end  = torch.randn(1, 3, 64, 64, device=device)
+    
     # -------------------------
     # Initial geodesic
     # -------------------------
@@ -662,7 +628,7 @@ def main():
         exp_map_fn=exp_map_fn,
         eps=1.0,
         n_iters=3,
-        n_candidates=3,
+        n_candidates=16,
         conf_kwargs=dict(
             eps=1.0,
             N=16,
@@ -674,7 +640,7 @@ def main():
     # -------------------------
     # Visualize
     # -------------------------
-    plot_curve_images(curves, Phi_fn, title="High-Confidence Curve Refinement (Diffusion)")
+    plot_curve_images(curves, Phi_fn, title="High-Confidence Curve Refinement")
 
 if __name__ == "__main__":
     main()
