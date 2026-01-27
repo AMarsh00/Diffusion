@@ -10,12 +10,10 @@ import os
 import math
 import torch
 import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
-import torch.nn.functional as F
 from torchvision import transforms
-from PIL import Image
-from scipy.stats import norm
+from PIL import Image, ImageDraw, ImageFont
+import torch.nn.functional as F
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 # ------------------------
@@ -180,15 +178,9 @@ def ddim_sample(model, scheduler, x_T, timesteps, eta=0.0):
     return x_t
 
 # ------------------------
-# Stein Score / Riemannian metric
+# Score function
 # ------------------------
 def score_fn(x, model, scheduler, t):
-    """
-    Computes the Stein score s_theta(x, t) = grad_x log p_t(x)
-    using epsilon model output.
-    x: [B, C, H, W]
-    t: int or tensor of shape [B]
-    """
     device = x.device
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
 
@@ -199,153 +191,81 @@ def score_fn(x, model, scheduler, t):
         t_tensor = t
         alpha_bar = alphas_cumprod[t]
 
-    epsilon_theta = model(x, t_tensor)  # [B,C,H,W]
-    score = - epsilon_theta / torch.sqrt(1 - alpha_bar)  # [B,C,H,W]
+    epsilon_theta = model(x, t_tensor)
+    score = - epsilon_theta / torch.sqrt(1 - alpha_bar)
     return score
 
 # ------------------------
-# Find nearest training point (used for the x_ind in the path integral)
+# Levi-Civita Exponential Map
 # ------------------------
-def find_nearest_training_point(y, train_images):
+def Jv_score(x, v, model, scheduler, t_idx):
     """
-    y: [B, C, H, W]
-    train_images: [N, C, H, W]
-    returns: [B, C, H, W] nearest image for each y in batch
+    Jacobian-vector product of the score: J_s(x) @ v
     """
-    B = y.shape[0]
-    nearest = []
+    x = x.detach().requires_grad_(True)
+    s = score_fn(x, model, scheduler, t_idx)
+    flat = (s * v).sum()
+    grad = torch.autograd.grad(flat, x, create_graph=False)[0]
+    return grad
 
-    # Flatten images for distance computation
-    y_flat = y.view(B, -1)                # [B, C*H*W]
-    train_flat = train_images.view(len(train_images), -1)  # [N, C*H*W]
+def levi_civita_exp_map(y, v, model, scheduler, t_idx, lam=1e6, n_steps=8):
+    """
+    True Levi-Civita exponential map along v
+    """
+    x = y.clone().detach().requires_grad_(True)
+    v = v.clone()
+    dt = 1.0 / n_steps
 
-    for i in range(B):
-        dists = ((train_flat - y_flat[i:i+1])**2).sum(dim=1)  # [N]
-        idx = dists.argmin()
-        nearest.append(train_images[idx])
+    for _ in range(n_steps):
+        s = score_fn(x, model, scheduler, t_idx)
+        s_flat = s.flatten(1)
+        v_flat = v.flatten(1)
 
-    return torch.stack(nearest, dim=0)  # [B, C, H, W]
+        s_norm2 = (s_flat * s_flat).sum(dim=1, keepdim=True)
+
+        Jv = Jv_score(x, v, model, scheduler, t_idx)
+        inner = (v * Jv).flatten(1).sum(dim=1, keepdim=True)
+
+        accel = -lam * inner / (1 + lam * s_norm2)
+        accel = accel.view(-1,1,1,1) * s
+
+        # update v and x
+        v = v + dt * accel
+        with torch.no_grad():
+            x += dt * v  # avoid creating unnecessary graph for x update
+
+    return x.detach()  # detach before returning
 
 # ------------------------
-# Path integral to a reference point
+# Log map shooting
 # ------------------------
 @torch.no_grad()
-def linear_path_integral_fast(y, y_target, model, scheduler, t_idx, n_steps=16):
-    # y, y_target: [B, C, H, W]
-
-    B = y.shape[0]
-    phi = torch.zeros(B, device=y.device)
-
-    # Flatten everything except batch dim
-    y_flat = y.flatten(1)                # [B, D]
-    y_target_flat = y_target.flatten(1)  # [B, D]
-
-    direction = y_target_flat - y_flat   # [B, D]
-    ds = 1.0 / (n_steps - 1)
-
-    for i in range(n_steps):
-        s = i * ds
-
-        # Interpolate in flattened form
-        y_s_flat = y_flat + s * direction       # [B, D]
-        y_s = y_s_flat.view_as(y)               # back to [B, C, H, W]
-
-        # Score function still expects 4D input
-        score = score_fn(y_s, model, scheduler, t_idx)  # [B, C, H, W]
-        score_flat = score.flatten(1)                   # [B, D]
-
-        # inner product <score, direction>
-        inner = (score_flat * direction).sum(dim=1)     # [B]
-
-        phi += inner * ds
-
-    return phi
-
-# ------------------------
-# Exponential map with our metric
-# ------------------------
-@torch.no_grad()
-def exp_map(y, v, model, scheduler, t_idx, train_images=None, beta=0.0, n_substeps=8, correct_every=1):
-    """
-    Exponential map along tangent vector `v` with score correction using the diffusion model.
-
-    Parameters:
-    - y: [B,C,H,W] starting point
-    - v: [B,C,H,W] tangent vector
-    - model: trained UNetSD
-    - scheduler: VPScheduler
-    - t_idx: diffusion timestep
-    - train_images: optional dataset for nearest neighbor
-    - beta: Riemannian metric parameters
-    - n_substeps: number of substeps
-    - correct_every: how often to apply diffusion-based correction
-    """
-    y_current = y
-    dx = v / n_substeps
-
-    for step in range(n_substeps):
-        # Compute score
-        s = score_fn(y_current, model, scheduler, t_idx)  # [B,C,H,W]
-
-        if beta != 0:
-            # Optional: nearest training point
-            if train_images is not None:
-                y_target = find_nearest_training_point(y_current, train_images)
-            else:
-                y_target = torch.zeros_like(y_current)
-    
-            # Path integral factor
-            Phi_val = linear_path_integral_fast(y_current, y_target, model, scheduler, t_idx)  # [B]
-            C = torch.exp(beta * Phi_val).view(-1, 1, 1, 1)  # broadcast
-        else:
-            C = 1
-
-        # Riemannian metric step
-        s_norm2 = (s * s).view(s.shape[0], -1).sum(dim=1, keepdim=True)  # [B,1]
-        proj = (s * dx).view(s.shape[0], -1).sum(dim=1, keepdim=True)    # [B,1]
-        denom = 1 + C * s_norm2
-        ginv_dx = dx - C * (proj / denom).view(-1,1,1,1) * s
-        y_current = y_current + ginv_dx
-
-    return y_current
-    
-# ------------------------
-# Log map shooting with new metric
-# ------------------------
-@torch.no_grad()
-def log_map_shooting(y, y_target, model, scheduler, t_idx, beta=0.0, max_iters=1000, lr=0.1, n_substeps_schedule=[1, 2, 4, 8, 16], train_images=None):
+def log_map_shooting(y, y_target, model, scheduler, t_idx, lam=1e6, max_iters=1000, lr=0.1, n_substeps_schedule=[1, 2, 4, 8],):
     y = y.detach()
     y_target = y_target.detach()
     tol = 1e-2
     momentum_gamma = 0.9
-    
+
     v = (y_target - y).detach().clone()
     v.requires_grad_(True)
-    
     momentum = torch.zeros_like(v)
     best_v = v.clone()
     best_loss = float('inf')
 
     for idx, n_substeps in enumerate(n_substeps_schedule):
         n_iters = max_iters // len(n_substeps_schedule)
-        V = best_v
         for i in range(n_iters):
-            y_pred = exp_map(y, v, model, scheduler, t_idx, beta=beta, n_substeps=n_substeps, train_images=train_images)
+            y_pred = levi_civita_exp_map(y, v, model, scheduler, t_idx, lam=lam, n_steps=n_substeps)
             residual = y_target - y_pred
-
             loss = residual.norm()**2
 
             if loss.item() < tol:
                 break
 
-            # normalize residual to prevent huge jumps
             step = lr * residual / (residual.norm() + 1e-8)
-
-            # apply momentum
             momentum = momentum_gamma * momentum + step
             v = v + momentum
 
-            # track best v only at the **max substeps stage**
             if n_substeps == n_substeps_schedule[-1] and loss.item() < best_loss:
                 best_loss = loss.item()
                 best_v = v.clone()
@@ -366,15 +286,10 @@ def load_image(path, image_size=64):
 
 @torch.no_grad()
 def Phi(y, model, scheduler, num_steps=50, eta=0.0):
-    """
-    Map noise y -> image x using DDIM deterministic sampling.
-    y: input noise tensor [B,C,H,W]
-    """
-    # Define timesteps for DDIM
     timesteps = torch.linspace(scheduler.num_timesteps-1, 0, num_steps, dtype=torch.long)
     x = ddim_sample(model, scheduler, y, timesteps, eta=eta)
     return x
-    
+
 # ------------------------
 # Dataset
 # ------------------------
@@ -395,145 +310,102 @@ class CelebAHQDataset(Dataset):
     def __getitem__(self, idx):
         image = Image.open(self.image_paths[idx]).convert("RGB")
         return self.transform(image)
-    
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    image_path_A = "/data5/accounts/marsh/Diffusion/celeba_hq_prepared/000100.png" # Replace with your path
 
-    x0_A = load_image(image_path_A).to(device) # Loading a dataset point to get correct size
+# ------------------------
+# Main
+# ------------------------
+def main():
+    device = "cpu"  # or "cuda" if available
+    image_path_A = "/data5/accounts/marsh/Diffusion/celeba_hq_prepared/000100.png" # Replace with your file path (just used to get size of dataset elements)
+
+    x0_A = load_image(image_path_A).to(device)
     xA_ = torch.randn_like(x0_A)
     xB_ = torch.randn_like(x0_A)
 
     model = UNetSD().to(device)
     scheduler = VPScheduler(num_timesteps=1000)
-    
-    checkpoint_path = "/data5/accounts/marsh/Diffusion/vp_diffusion_outputs/unet_epoch_2000.pt" # Replace with your path
+
+    checkpoint_path = "/data5/accounts/marsh/Diffusion/vp_diffusion_outputs/unet_epoch_2000.pt" # Replace with your filepath
     if os.path.isfile(checkpoint_path):
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         print("Loaded trained model.")
     else:
         print("Checkpoint not found. Using random weights.")
     model.eval()
-    
+
     xA = Phi(xA_, model, scheduler, num_steps=1000)
     xB = Phi(xB_, model, scheduler, num_steps=1000)
 
-    # 1?Initialize the dataset
-    train_dataset = CelebAHQDataset(root_dir="/data5/accounts/marsh/Diffusion/celeba_hq_prepared", image_size=64)
-    
-    # 2 Load all images into a single tensor
-    def dataset_to_tensor(dataset, batch_size=64):
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-        all_images = []
-    
-        for batch in loader:
-            all_images.append(batch)  # batch shape: [B, C, H, W]
-    
-        # Concatenate all batches
-        all_images_tensor = torch.cat(all_images, dim=0)  # [N, C, H, W]
-        return all_images_tensor
-    
-    train_dataset_tensors = dataset_to_tensor(train_dataset)  # [N, C, H, W]
-    
-    print(f"Loaded {train_dataset_tensors.shape[0]} images into tensor")
-    
-    # 3. Choose diffusion timestep for metric
-    t_idx = 400
+    # Dataset
+    train_dataset = CelebAHQDataset(root_dir="/data5/accounts/marsh/Diffusion/celeba_hq_prepared", image_size=64) # Replace with your filepath
+    loader = DataLoader(train_dataset, batch_size=64, shuffle=False)
+    train_images = torch.cat([b for b in loader], dim=0)
 
-    # 4. Compute geodesics for multiple beta values (bidirectional)
+    # Timestep for metric
+    t_idx = 400
     beta_values = [-50.0, -25.0, -10.0, -5.0, -2.5, -1.0, 0]
     n_geo_steps = 10
     all_geodesics = {}
-    
-    # Compute noisy starting points
+    lam = 1e6
+
+    # Noisy starting points
     xA2 = ddim_sample(model, scheduler, xA_, torch.linspace(999-t_idx, 0, 1000-t_idx, dtype=torch.long, device=device))
     xB2 = ddim_sample(model, scheduler, xB_, torch.linspace(999-t_idx, 0, 1000-t_idx, dtype=torch.long, device=device))
-    
+
     for beta in beta_values:
         print(f"Computing bidirectional geodesic for beta={beta}...")
-    
-        # Log maps for each half
-        v_forward = log_map_shooting(
-            y=xA2, y_target=xB2,
-            model=model, scheduler=scheduler,
-            t_idx=t_idx, beta=beta,
-            max_iters=1000, lr=1e-1,
-            train_images=train_dataset_tensors
-        )
-    
-        v_backward = log_map_shooting(
-            y=xB2, y_target=xA2,
-            model=model, scheduler=scheduler,
-            t_idx=t_idx, beta=beta,
-            max_iters=1000, lr=1e-1,
-            train_images=train_dataset_tensors
-        )
-    
-        # Construct geodesic
+        v_forward = log_map_shooting(xA2, xB2, model, scheduler, t_idx, lam=lam)
+        v_backward = log_map_shooting(xB2, xA2, model, scheduler, t_idx, lam=lam)
+
         geodesic = []
         for i in range(n_geo_steps):
             s = i / (n_geo_steps - 1)
             if s <= 0.5:
-                # Forward half
-                y_s = exp_map(xA2, s * v_forward, model=model, scheduler=scheduler,
-                              t_idx=t_idx, train_images=train_dataset_tensors, beta=beta)
+                y_s = levi_civita_exp_map(xA2, s * v_forward, model, scheduler, t_idx, lam=lam)
             else:
-                # Backward half
-                y_s = exp_map(xB2, (1-s) * v_backward, model=model, scheduler=scheduler,
-                              t_idx=t_idx, train_images=train_dataset_tensors, beta=beta)
-    
-            x0_pred = ddim_sample(
-                model, scheduler, y_s,
-                torch.linspace(t_idx-1, 0, t_idx, dtype=torch.long, device=device)
-            )
+                y_s = levi_civita_exp_map(xB2, (1-s) * v_backward, model, scheduler, t_idx, lam=lam)
+
+            x0_pred = ddim_sample(model, scheduler, y_s,
+                                  torch.linspace(t_idx-1, 0, t_idx, dtype=torch.long, device=device))
             geodesic.append(x0_pred.detach().cpu())
-    
+
         all_geodesics[beta] = geodesic
         print(f"Geodesic complete for beta={beta}.")
 
-    # 5. Linear interpolation in noise space
+    # Linear interpolation
     linear_interp = []
     for i in range(n_geo_steps):
         s = i / (n_geo_steps - 1)
         y_s = (1 - s) * xA2 + s * xB2
-        x_s = ddim_sample(model, scheduler, y_s, torch.linspace(t_idx-1, 0, t_idx, dtype=torch.long, device=device))
+        x_s = ddim_sample(model, scheduler, y_s,
+                          torch.linspace(t_idx-1, 0, t_idx, dtype=torch.long, device=device))
         linear_interp.append(x_s.detach().cpu())
 
-    # 6. Plot all results
-    from PIL import ImageDraw, ImageFont
+    # Plot results
     os.makedirs("geodesic_frames", exist_ok=True)
-
-    # First compute width and height of individual images
     width, height = (64, 64)
-
-    label_height = 15  # pixels to reserve for labels between rows
-
+    label_height = 15
     total_width = width * n_geo_steps
     total_height = height * len(beta_values) + height + label_height * (len(beta_values) + 1)
-    
     final_image = Image.new("RGB", (total_width, total_height), color=(0,0,0))
-    
-    # Optional: simple font for labels
     try:
         font = ImageFont.load_default()
     except:
         font = None
-    
+
     for row_idx, beta in enumerate(beta_values):
         geodesic = all_geodesics[beta]
-        y_offset = row_idx * (height + label_height)  # include label spacing
-        # Add label above the row
+        y_offset = row_idx * (height + label_height)
         if font:
             draw = ImageDraw.Draw(final_image)
             draw.text((0, y_offset), f"theta={beta}", fill=(255,0,0), font=font)
-        # Paste images below label
         y_offset += label_height
         for col_idx, frame in enumerate(geodesic):
             img = frame.squeeze(0)
             img = (img * 0.5 + 0.5).clamp(0, 1)
             pil_img = transforms.ToPILImage()(img.cpu())
             final_image.paste(pil_img, (col_idx * width, y_offset))
-    
+
     # Linear interpolation row
     y_offset = len(beta_values) * (height + label_height)
     if font:
@@ -545,10 +417,9 @@ def main():
         img = (img * 0.5 + 0.5).clamp(0, 1)
         pil_img = transforms.ToPILImage()(img.cpu())
         final_image.paste(pil_img, (col_idx * width, y_offset))
-    
-    output_path = "geodesic_frames/all_geodesics_2.png"
-    final_image.save(output_path)
-    print(f"Saved all geodesics and linear interpolation to {output_path}")
+
+    final_image.save("geodesic_vs_lerp.png")
+    print("Saved geodesic_vs_lerp.png")
 
 if __name__ == "__main__":
     main()
