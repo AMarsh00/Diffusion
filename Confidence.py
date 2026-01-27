@@ -355,7 +355,7 @@ def confidence_metric(
 # Main
 # ------------------------
 def main():
-    device="cuda"#"cpu"
+    device="cpu" # or cuda if available
     t_idx = 400
     beta_values = [-50.0, -25.0, -10.0, -5.0, -2.5, -1.0, 0]
     n_geo_steps = 10
