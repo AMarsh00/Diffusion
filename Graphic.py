@@ -1,7 +1,7 @@
 """
 Graphic.py
 Alexander Marsh
-2 January 2026
+27 January 2026
 
 Displays geodesics with our metric in the simple Gaussian case for various values of theta
 """
@@ -136,3 +136,4 @@ plt.title("True Riemannian Geodesics for g = I + w(x) s sᵀ")
 plt.xlabel("x")
 plt.ylabel("y")
 plt.show()
+
