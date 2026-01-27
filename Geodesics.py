@@ -25,7 +25,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
         self.dim = dim
 
     def forward(self, timestep):
-        device = timestep.device
+        device = "cpu" # or "cuda" if available
         half_dim = self.dim // 2
         embeddings = math.log(10000) / (half_dim - 1)
         embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
@@ -264,7 +264,8 @@ def log_map_shooting(y, y_target, model, scheduler, t_idx, lam=1e6, max_iters=10
     for idx, n_substeps in enumerate(n_substeps_schedule):
         n_iters = max_iters // len(n_substeps_schedule)
         for i in range(n_iters):
-            y_pred = levi_civita_exp_map(y, v, model, scheduler, t_idx, lam=lam, n_steps=n_substeps)
+            y_pred = levi_civita_exp_map(y, v, model, scheduler, t_idx,
+                                         lam=lam, n_steps=n_substeps)
             residual = y_target - y_pred
             loss = residual.norm()**2
 
@@ -325,7 +326,7 @@ class CelebAHQDataset(Dataset):
 # ------------------------
 def main():
     device = "cpu"  # or "cuda" if available
-    image_path_A = "/data5/accounts/marsh/Diffusion/celeba_hq_prepared/000100.png" # Replace with your file path (just used to get size of dataset elements)
+    image_path_A = "/data5/accounts/marsh/Diffusion/celeba_hq_prepared/000100.png" # Replace with your filepath
 
     x0_A = load_image(image_path_A).to(device)
     xA_ = torch.randn_like(x0_A)
