@@ -272,43 +272,54 @@ def confidence_metric(
     lr: float = 0.01
 ):
     device = z.device
-    # Sample e-ball
     shape = z.shape
     d = z.numel() // z.shape[0]
+
+    # --- Sample N points on the epsilon-ball ---
     u = torch.randn(N, *shape[1:], device=device).view(N, -1)
     u = u / u.norm(dim=1, keepdim=True) * eps
     Z = z + u.view(N, *shape[1:])
-    # Expected primitive
+
+    # --- Compute expected primitive (vectorized) ---
     z_t = z.clone()
+    tol = 1e-3
+    momentum_gamma = 0.9
+    momentum = torch.zeros_like(z_t).repeat(N, *[1]*(len(z_t.shape)-1))
     for t in range(max_iter):
-        grad = torch.zeros_like(z_t)
-        for i in range(N):
-            Phi_zt = Phi_fn(z_t)
-            Phi_Zi = Phi_fn(Z[i:i+1])
-            logs = log_map_fn(Phi_zt, Phi_Zi)
-            zt_norm2 = (z_t**2).sum()
-            Zi_norm2 = (Z[i:i+1]**2).sum()
-            w = torch.exp(0.5 * (zt_norm2 - Zi_norm2))
-            grad -= 2 * w * logs
+        # Expand z_t to match Z batch
+        z_t_exp = z_t.expand(N, *z_t.shape[1:])
+        Phi_zt = Phi_fn(z_t_exp)         # Shape: [N, C, H, W]
+        Phi_Z = Phi_fn(Z)                # Shape: [N, C, H, W]
+        logs = log_map_fn(Phi_zt, Phi_Z) # [N, C, H, W]
+        
+        # Compute weights: w = exp(0.5 * (||z_t||^2 - ||Z||^2))
+        zt_norm2 = (z_t**2).sum()
+        Z_norm2 = (Z**2).view(N, -1).sum(dim=1)
+        w = torch.exp(0.5 * (zt_norm2 - Z_norm2)).view(N, 1, 1, 1)
+        
+        # Gradient step (vectorized)
+        grad = -2 * (w * logs).mean(dim=0, keepdim=True)
         z_next = z_t - lr * grad
-        if (z_next - z).view(-1).norm() >= eps:
-            z_next = z_t
+
+        if (z_next - z_t).view(-1).norm() < tol:
             break
         z_t = z_next
+
     y_star = z_t
-    # Geodesic distances
-    geodesic_dists = []
-    for i in range(N):
-        log_i = log_map_fn(y_star, Z[i:i+1])
-        dist_i = (log_i**2).sum().item()
-        geodesic_dists.append(dist_i)
-    geodesic_dists = torch.tensor(geodesic_dists, device=device)
-    log_center = log_map_fn(Phi_fn(y_star), Phi_fn(z))
+
+    # --- Geodesic distances (vectorized) ---
+    y_star_exp = y_star.expand(N, *y_star.shape[1:])
+    log_vec = log_map_fn(y_star_exp, Z)
+    geodesic_dists = (log_vec.view(N, -1)**2).sum(dim=1)
+
+    log_center = log_map_fn(Phi_fn(y_star.unsqueeze(0)), Phi_fn(z))
     dist_center = (log_center**2).sum().item()
+
     z_star_norm = (y_star**2).sum()
     Z_norm = (Z**2).view(N, -1).sum(dim=1)
     weights = torch.exp(0.5 * (z_star_norm - Z_norm))
     var_R = (weights * geodesic_dists).mean().item()
+
     C = torch.log(torch.tensor(var_R)) + dist_center**2 / (var_R + 1e-5)
     return C.item(), var_R, dist_center
 
