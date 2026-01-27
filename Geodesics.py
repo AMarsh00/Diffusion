@@ -25,7 +25,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
         self.dim = dim
 
     def forward(self, timestep):
-        device = "cpu" # or "cuda" if available
+        device = "cpu"#timestep.device
         half_dim = self.dim // 2
         embeddings = math.log(10000) / (half_dim - 1)
         embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
@@ -196,60 +196,69 @@ def score_fn(x, model, scheduler, t):
     return score
 
 # ------------------------
-# Levi-Civita Exponential Map
+# Path-Integral Metric & Levi-Civita
 # ------------------------
-def Jv_score(x, v, model, scheduler, t_idx):
+def path_integral_metric(x, model, scheduler, t_idx, x_ind=None, beta=1.0, n_steps_int=10):
     """
-    Jacobian-vector product of the score: J_s(x) @ v
+    Compute G = I + exp(beta * integral) * (score score^T)
+    x: [dim] tensor
+    x_ind: reference point for integral (default origin)
+    n_steps_int: number of steps to discretize path integral
     """
-    x = x.detach().requires_grad_(True)
-    s = score_fn(x, model, scheduler, t_idx)
-    flat = (s * v).sum()
-    grad = torch.autograd.grad(flat, x, create_graph=False)[0]
-    return grad
+    if x_ind is None:
+        x_ind = torch.zeros_like(x)
 
-def levi_civita_exp_map(x, v, model, scheduler, t_idx, lam=1.0, n_steps=10):
+    dx = (x - x_ind) / n_steps_int
+    integral = 0.0
+    xk = x_ind.clone().detach()
+
+    for _ in range(n_steps_int):
+        s = score_fn(xk, model, scheduler, t_idx)  # score at xk
+        integral += torch.dot(s.view(-1), dx.view(-1))
+        xk = xk + dx
+
+    s_x = score_fn(x, model, scheduler, t_idx).view(-1, 1)
+    G = torch.eye(len(x), device=x.device) + torch.exp(beta * integral) * (s_x @ s_x.T)
+    return G
+
+def levi_civita_exp_map(x, v, model, scheduler, t_idx, beta=1.0, x_ind=None, n_steps=10, n_steps_int=10):
     """
-    Levi-Civita exponential map with vectorized updates
+    Levi-Civita exponential map using path-integral metric with Sherman-Morrison
     """
     x_curr = x.clone().detach()
-    v_curr = v.clone().detach()
-
-    dt = 1.0 / n_steps
+    v_step = v / n_steps
 
     for _ in range(n_steps):
-        x_curr.requires_grad_(True)
-        
-        # Compute score
-        s = model(x_curr, torch.tensor([t_idx]))  # shape [batch, dim]
-        
-        # Metric
-        p_x = torch.exp(model.log_prob(x_curr))  # or any density from model
-        weight = p_x / p_x[0].detach()  # normalize
-        g = torch.eye(x.shape[-1], device=x.device) + weight * (s.unsqueeze(-1) @ s.unsqueeze(0))
-        
-        # Jacobian-vector product
-        Jv = torch.autograd.grad(
-            s, x_curr, grad_outputs=v_curr, retain_graph=False, create_graph=False
-        )[0]
+        # Compute metric (rank-1)
+        if x_ind is None:
+            x_ind = torch.zeros_like(x_curr)
 
-        # Levi-Civita acceleration
-        s_norm2 = (s**2).sum(-1, keepdim=True)
-        inner = (v_curr * Jv).sum(-1, keepdim=True)
-        accel = -lam * inner / (1 + lam * s_norm2) * s
+        dx_int = (x_curr - x_ind) / n_steps_int
+        integral = 0.0
+        xk = x_ind.clone().detach()
+        for _ in range(n_steps_int):
+            s = score_fn(xk, model, scheduler, t_idx).view(-1)
+            integral += torch.dot(s, dx_int.view(-1))
+            xk = xk + dx_int
 
-        # update velocity & position
-        v_curr = v_curr + dt * accel
-        dx = torch.linalg.solve(g, v_curr)
-        x_curr = x_curr + dt * dx
+        s_x = score_fn(x_curr, model, scheduler, t_idx).view(-1)
+        w = torch.exp(beta * integral)
 
-    return x_curr
+        # Solve G dx = v_step via Sherman-Morrison
+        s_dot_s = (s_x**2).sum()
+        s_dot_v = (s_x * v_step.view(-1)).sum()
+        dx = v_step.view(-1) - w * s_x * s_dot_v / (1 + w * s_dot_s)
+        dx = dx.view_as(x_curr)
+
+        x_curr = x_curr + dx
+
+    return x_curr.detach()
 
 # ------------------------
 # Log map shooting
 # ------------------------
 @torch.no_grad()
-def log_map_shooting(y, y_target, model, scheduler, t_idx, lam=1e6, max_iters=1000, lr=0.1, n_substeps_schedule=[1, 2, 4, 8],):
+def log_map_shooting(y, y_target, model, scheduler, t_idx, beta=1e6, max_iters=1000, lr=0.1, n_substeps_schedule=[1, 2, 4, 8],):
     y = y.detach()
     y_target = y_target.detach()
     tol = 1e-2
@@ -265,7 +274,7 @@ def log_map_shooting(y, y_target, model, scheduler, t_idx, lam=1e6, max_iters=10
         n_iters = max_iters // len(n_substeps_schedule)
         for i in range(n_iters):
             y_pred = levi_civita_exp_map(y, v, model, scheduler, t_idx,
-                                         lam=lam, n_steps=n_substeps)
+                                         beta=beta, n_steps=n_substeps)
             residual = y_target - y_pred
             loss = residual.norm()**2
 
@@ -364,16 +373,16 @@ def main():
 
     for beta in beta_values:
         print(f"Computing bidirectional geodesic for beta={beta}...")
-        v_forward = log_map_shooting(xA2, xB2, model, scheduler, t_idx, lam=lam)
-        v_backward = log_map_shooting(xB2, xA2, model, scheduler, t_idx, lam=lam)
+        v_forward = log_map_shooting(xA2, xB2, model, scheduler, t_idx, beta=beta)
+        v_backward = log_map_shooting(xB2, xA2, model, scheduler, t_idx, beta=beta)
 
         geodesic = []
         for i in range(n_geo_steps):
             s = i / (n_geo_steps - 1)
             if s <= 0.5:
-                y_s = levi_civita_exp_map(xA2, s * v_forward, model, scheduler, t_idx, lam=lam)
+                y_s = levi_civita_exp_map(xA2, s * v_forward, model, scheduler, t_idx, beta=beta)
             else:
-                y_s = levi_civita_exp_map(xB2, (1-s) * v_backward, model, scheduler, t_idx, lam=lam)
+                y_s = levi_civita_exp_map(xB2, (1-s) * v_backward, model, scheduler, t_idx, beta=beta)
 
             x0_pred = ddim_sample(model, scheduler, y_s,
                                   torch.linspace(t_idx-1, 0, t_idx, dtype=torch.long, device=device))
