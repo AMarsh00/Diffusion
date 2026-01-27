@@ -15,66 +15,128 @@ import matplotlib.pyplot as plt
 def gaussian_2d(x):
     return (1.0 / (2 * np.pi)) * np.exp(-0.5 * np.sum(x**2, axis=-1))
 
+
+def log_gaussian_2d(x):
+    return -0.5 * np.sum(x**2, axis=-1) - np.log(2 * np.pi)
+
+
 def score(x):
     """∇ log p(x) for N(0, I)"""
-    return -x-np.log(2*np.pi)
+    return -x
+
 
 # ============================================================
-# Inverse Riemannian metric (Algorithm 2)
+# Weight w(x) = exp(theta (log p(x) - log p(0)))
 # ============================================================
-def g_inv_metric(x, theta=0.0):
-    eps = 1e-300
-    p_x = np.maximum(gaussian_2d(x), eps)
-    p_ind = gaussian_2d(np.zeros_like(x))
-    s = score(x)
-    w = np.exp(-theta * (np.log(p_x) - np.log(p_ind)))
-    denom = 1.0 + w * np.dot(s, s)
-    return np.eye(len(x)) - (w / denom) * np.outer(s, s)
+def weight(x, theta):
+    return np.exp(theta * (log_gaussian_2d(x) - log_gaussian_2d(np.zeros_like(x))))
+
 
 # ============================================================
-# First-order Riemannian exponential map (Algorithm 2)
+# Geodesic acceleration (Christoffel contraction)
 # ============================================================
-def riemannian_exponential_first_order(x, v, n_steps, theta=0.0):
-    x_k = x.copy()
-    dv = v / n_steps
+def geodesic_acceleration(x, v, theta):
+    w = weight(x, theta)
+
+    r2 = np.dot(x, x)
+    v2 = np.dot(v, v)
+    xv = np.dot(x, v)
+
+    coeff = w / (1.0 + w * r2)
+
+    return -coeff * (v2 * x - xv * v)
+
+
+# ============================================================
+# One symplectic geodesic step
+# ============================================================
+def geodesic_step(x, v, dt, theta):
+    a = geodesic_acceleration(x, v, theta)
+    v_new = v + dt * a
+    x_new = x + dt * v_new
+    return x_new, v_new
+
+
+# ============================================================
+# Riemannian exponential via geodesic integration
+# ============================================================
+def riemannian_exponential(x0, v0, n_steps, theta, dt=1e-2):
+    x = x0.copy()
+    v = v0.copy()
+
     for _ in range(n_steps):
-        ginv = g_inv_metric(x_k, theta=theta)
-        x_k = x_k + ginv @ dv
+        x, v = geodesic_step(x, v, dt, theta)
 
-    return x_k
+    return x
+
 
 # ============================================================
-# Riemannian logarithm map via shooting (Algorithm 1)
+# Riemannian logarithm via shooting (updated)
 # ============================================================
-def riemannian_logarithm(x, y, n_steps, theta=0.0, eta=1e-3, n_max_iter=300, tol=1e-3):
+def riemannian_logarithm(
+    x,
+    y,
+    theta=0.0,
+    n_steps=200,
+    dt=1e-2,
+    eta=1e-2,
+    n_max_iter=500,
+    tol=1e-3,
+):
     v = np.zeros_like(x)
+
     for _ in range(n_max_iter):
-        exp_v = riemannian_exponential_first_order(x, v, n_steps, theta)
+        exp_v = riemannian_exponential(x, v, n_steps, theta, dt)
         residual = y - exp_v
         loss = np.linalg.norm(residual) ** 2
+
         if loss < tol:
             break
+
+        # Euclidean shooting update
         v += eta * residual
 
     return v
 
+
 # ============================================================
-# Gradient descent for expected primitive (Algorithm 3)
+# Gradient descent for expected primitive (UPDATED)
 # ============================================================
-def expected_primitive(samples, z0, theta=0.0, eta=5e-3, Q=20, n_steps=10,):
+def expected_primitive(
+    samples,
+    z0,
+    theta=0.0,
+    eta=5e-3,
+    Q=20,
+    n_steps=200,
+    dt=1e-2,
+):
     z = z0.copy()
     trajectory = [z.copy()]
+
     for _ in range(Q):
         grad = np.zeros_like(z)
+
         for zi in samples:
-            L = riemannian_logarithm(z, zi, n_steps, theta=theta)
-            weight = np.exp(0.5 * (np.dot(z, z) - np.dot(zi, zi)))
-            grad += -2.0 * weight * L
+            L = riemannian_logarithm(
+                z,
+                zi,
+                theta=theta,
+                n_steps=n_steps,
+                dt=dt,
+            )
+            weight_term = np.exp(0.5 * (np.dot(z, z) - np.dot(zi, zi)))
+            grad += -2.0 * weight_term * L
+
         z = z - eta * grad
         trajectory.append(z.copy())
 
     return np.array(trajectory)
 
+
+# ============================================================
+# Run experiment
+# ============================================================
 if __name__ == "__main__":
     rng = np.random.default_rng(5)
 
@@ -88,9 +150,16 @@ if __name__ == "__main__":
     # Parameters
     theta = 1.0
     Q = 20
-    n_steps = 10
 
-    traj = expected_primitive(samples, z0, theta=theta, eta=5e-3, Q=Q, n_steps=n_steps,)
+    traj = expected_primitive(
+        samples,
+        z0,
+        theta=theta,
+        eta=5e-3,
+        Q=Q,
+        n_steps=200,
+        dt=1e-2,
+    )
 
     # ========================================================
     # Plot
@@ -103,13 +172,26 @@ if __name__ == "__main__":
     plt.figure(figsize=(8, 6))
     plt.contourf(X, Y, Z, levels=40, cmap="viridis")
 
-    plt.plot(traj[:, 0], traj[:, 1], "-o", color="red", lw=2, label="Expected primitive updates",)
+    plt.plot(
+        traj[:, 0],
+        traj[:, 1],
+        "-o",
+        color="red",
+        lw=2,
+        label="Expected primitive (geodesic)",
+    )
 
     plt.scatter(z0[0], z0[1], c="yellow", s=80, label="Start")
-    plt.scatter(traj[-1, 0], traj[-1, 1], c="cyan", s=80, label="Final",)
+    plt.scatter(
+        traj[-1, 0],
+        traj[-1, 1],
+        c="cyan",
+        s=80,
+        label="Final",
+    )
 
     plt.legend()
-    plt.title("Gradient Descent Toward Expected Primitive")
+    plt.title("Gradient Descent Toward Expected Primitive (True Geodesics)")
     plt.xlabel("x")
     plt.ylabel("y")
     plt.colorbar(label="Gaussian density")
