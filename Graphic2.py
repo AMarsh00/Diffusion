@@ -1,7 +1,7 @@
 """
 Graphic2.py
 Alexander Marsh
-2 January 2026
+27 January 2026
 
 Displays expected primitive updates in the simple Gaussian case.
 """
@@ -196,3 +196,4 @@ if __name__ == "__main__":
     plt.ylabel("y")
     plt.colorbar(label="Gaussian density")
     plt.show()
+
