@@ -221,7 +221,7 @@ def levi_civita_exp_map(x, v, model, scheduler, t_idx, lam=1.0, n_steps=10):
         x_curr.requires_grad_(True)
         
         # Compute score
-        s = model(x_curr, t_idx)  # shape [batch, dim]
+        s = model(x_curr, torch.tensor([t_idx]))  # shape [batch, dim]
         
         # Metric
         p_x = torch.exp(model.log_prob(x_curr))  # or any density from model
