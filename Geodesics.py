@@ -208,33 +208,42 @@ def Jv_score(x, v, model, scheduler, t_idx):
     grad = torch.autograd.grad(flat, x, create_graph=False)[0]
     return grad
 
-def levi_civita_exp_map(y, v, model, scheduler, t_idx, lam=1e6, n_steps=8):
+def levi_civita_exp_map(x, v, model, scheduler, t_idx, lam=1.0, n_steps=10):
     """
-    True Levi-Civita exponential map along v
+    Levi-Civita exponential map with vectorized updates
     """
-    x = y.clone().detach().requires_grad_(True)
-    v = v.clone()
+    x_curr = x.clone().detach()
+    v_curr = v.clone().detach()
+
     dt = 1.0 / n_steps
 
     for _ in range(n_steps):
-        s = score_fn(x, model, scheduler, t_idx)
-        s_flat = s.flatten(1)
-        v_flat = v.flatten(1)
+        x_curr.requires_grad_(True)
+        
+        # Compute score
+        s = model(x_curr, t_idx)  # shape [batch, dim]
+        
+        # Metric
+        p_x = torch.exp(model.log_prob(x_curr))  # or any density from model
+        weight = p_x / p_x[0].detach()  # normalize
+        g = torch.eye(x.shape[-1], device=x.device) + weight * (s.unsqueeze(-1) @ s.unsqueeze(0))
+        
+        # Jacobian-vector product
+        Jv = torch.autograd.grad(
+            s, x_curr, grad_outputs=v_curr, retain_graph=False, create_graph=False
+        )[0]
 
-        s_norm2 = (s_flat * s_flat).sum(dim=1, keepdim=True)
+        # Levi-Civita acceleration
+        s_norm2 = (s**2).sum(-1, keepdim=True)
+        inner = (v_curr * Jv).sum(-1, keepdim=True)
+        accel = -lam * inner / (1 + lam * s_norm2) * s
 
-        Jv = Jv_score(x, v, model, scheduler, t_idx)
-        inner = (v * Jv).flatten(1).sum(dim=1, keepdim=True)
+        # update velocity & position
+        v_curr = v_curr + dt * accel
+        dx = torch.linalg.solve(g, v_curr)
+        x_curr = x_curr + dt * dx
 
-        accel = -lam * inner / (1 + lam * s_norm2)
-        accel = accel.view(-1,1,1,1) * s
-
-        # update v and x
-        v = v + dt * accel
-        with torch.no_grad():
-            x += dt * v  # avoid creating unnecessary graph for x update
-
-    return x.detach()  # detach before returning
+    return x_curr
 
 # ------------------------
 # Log map shooting
