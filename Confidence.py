@@ -218,31 +218,59 @@ def levi_civita_exp_map(y, v, model, scheduler, t_idx, beta=1.0, n_substeps=8):
 # Levi-Civita Log Map Shooting
 # ------------------------
 @torch.no_grad()
-def levi_civita_log_map(y, y_target, model, scheduler, t_idx,
-                        beta=1.0, n_substeps_schedule=[1,2,4,8], max_iters=500, lr=0.1):
-    y = y.detach().clone()
-    y_target = y_target.detach().clone()
+def levi_civita_log_map(Y, Y_target, model, scheduler, t_idx,
+                              beta=1.0, n_substeps_schedule=[1,2,4,8],
+                              max_iters=500, lr=0.1):
+    """
+    Vectorized Levi-Civita log map (batch version).
+
+    Y: [N, C, H, W] starting points
+    Y_target: [N, C, H, W] target points
+    """
+    N = Y.shape[0]
+
+    # Detach inputs
+    Y = Y.detach().clone()
+    Y_target = Y_target.detach().clone()
+
     tol = 1e-3
     momentum_gamma = 0.9
-    v = (y_target - y).clone().detach()
-    v.requires_grad_(True)
+
+    # Initial tangent vectors
+    v = (Y_target - Y).clone().detach()
+    v.requires_grad_(False)
+
     momentum = torch.zeros_like(v)
     best_v = v.clone()
-    best_loss = float('inf')
+    best_loss = torch.full((N,), float('inf'), device=Y.device)
+
     for n_substeps in n_substeps_schedule:
         n_iters = max_iters // len(n_substeps_schedule)
         for i in range(n_iters):
-            y_pred = levi_civita_exp_map(y, v, model, scheduler, t_idx, beta=beta, n_substeps=n_substeps)
-            residual = y_target - y_pred
-            loss = residual.norm()**2
-            if loss.item() < tol:
+            # Compute predicted endpoints via exp map (vectorized)
+            Y_pred = levi_civita_exp_map(Y, v, model, scheduler, t_idx,
+                                         beta=beta, n_substeps=n_substeps)
+
+            # Residuals and per-sample loss
+            residual = Y_target - Y_pred          # [N, C, H, W]
+            loss = residual.view(N, -1).norm(dim=1)**2  # [N]
+
+            # Break if all below tolerance
+            if (loss < tol).all():
                 break
-            step = lr * residual / (residual.norm() + 1e-8)
+
+            # Step with normalization
+            step = lr * residual / (residual.view(N, -1).norm(dim=1).view(N,1,1,1) + 1e-8)
+
+            # Momentum update
             momentum = momentum_gamma * momentum + step
             v = v + momentum
-            if n_substeps == n_substeps_schedule[-1] and loss.item() < best_loss:
-                best_loss = loss.item()
-                best_v = v.clone()
+
+            # Track best v for final substeps
+            mask = (n_substeps == n_substeps_schedule[-1]) & (loss < best_loss)
+            best_loss = torch.where(loss < best_loss, loss, best_loss)
+            best_v = torch.where(mask.view(N,1,1,1), v, best_v)
+
     return best_v
 
 # ------------------------
