@@ -1,7 +1,7 @@
 """
 Confidence.py
 Alexander Marsh
-2 January 2026
+27 January 2026
 
 Computes and displays confidence scores for 16 random generations
 """
@@ -10,13 +10,12 @@ import os
 import math
 import torch
 import torch.nn as nn
+from torchvision import transforms
+from PIL import Image
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image, ImageDraw, ImageFont
-from torchvision import transforms
-from scipy.stats import norm
 
 # ------------------------
 # UNetSD Components
@@ -156,6 +155,7 @@ class VPScheduler:
 # ------------------------
 # DDIM deterministic sampling
 # ------------------------
+@torch.no_grad()
 def ddim_sample(model, scheduler, x_T, timesteps, eta=0.0):
     x_t = x_T
     device = x_t.device
@@ -183,178 +183,66 @@ def ddim_sample(model, scheduler, x_T, timesteps, eta=0.0):
 # Stein Score / Riemannian metric
 # ------------------------
 def score_fn(x, model, scheduler, t):
-    """
-    Computes the Stein score s_theta(x, t) = grad_x log p_t(x)
-    using epsilon model output.
-    x: [B, C, H, W]
-    t: int or tensor of shape [B]
-    """
     device = x.device
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
-
     if isinstance(t, int):
         t_tensor = torch.tensor([t], device=device)
         alpha_bar = alphas_cumprod[t]
     else:
         t_tensor = t
         alpha_bar = alphas_cumprod[t]
-
-    epsilon_theta = model(x, t_tensor)  # [B,C,H,W]
-    score = - epsilon_theta / torch.sqrt(1 - alpha_bar)  # [B,C,H,W]
+    epsilon_theta = model(x, t_tensor)
+    score = - epsilon_theta / torch.sqrt(1 - alpha_bar)
     return score
 
 # ------------------------
-# Find nearest training point (for x_ind in path integral later)
-# ------------------------
-def find_nearest_training_point(y, train_images):
-    """
-    y: [B, C, H, W]
-    train_images: [N, C, H, W]
-    returns: [B, C, H, W] nearest image for each y in batch
-    """
-    B = y.shape[0]
-    nearest = []
-
-    # Flatten images for distance computation
-    y_flat = y.view(B, -1)                # [B, C*H*W]
-    train_flat = train_images.view(len(train_images), -1)  # [N, C*H*W]
-
-    for i in range(B):
-        dists = ((train_flat - y_flat[i:i+1])**2).sum(dim=1)  # [N]
-        idx = dists.argmin()
-        nearest.append(train_images[idx])
-
-    return torch.stack(nearest, dim=0)  # [B, C, H, W]
-    
-# ------------------------
-# Approximate the path integral
+# Levi-Civita Exponential Map
 # ------------------------
 @torch.no_grad()
-def linear_path_integral_fast(y, y_target, model, scheduler, t_idx, n_steps=16):
-    # y, y_target: [B, C, H, W]
-
-    B = y.shape[0]
-    phi = torch.zeros(B, device=y.device)
-
-    # Flatten everything except batch dim
-    y_flat = y.flatten(1)                # [B, D]
-    y_target_flat = y_target.flatten(1)  # [B, D]
-
-    direction = y_target_flat - y_flat   # [B, D]
-    ds = 1.0 / (n_steps - 1)
-
-    for i in range(n_steps):
-        s = i * ds
-
-        # Interpolate in flattened form
-        y_s_flat = y_flat + s * direction       # [B, D]
-        y_s = y_s_flat.view_as(y)               # back to [B, C, H, W]
-
-        # Score function still expects 4D input
-        score = score_fn(y_s, model, scheduler, t_idx)  # [B, C, H, W]
-        score_flat = score.flatten(1)                   # [B, D]
-
-        # inner product <score, direction>
-        inner = (score_flat * direction).sum(dim=1)     # [B]
-
-        phi += inner * ds
-
-    return phi
-
-# ------------------------
-# Exponential map with new metric
-# ------------------------
-@torch.no_grad()
-def exp_map(y, v, model, scheduler, t_idx, train_images=None, beta=0.0, n_substeps=8, correct_every=1):
-    """
-    Exponential map along tangent vector `v` with score correction using the diffusion model.
-
-    Parameters:
-    - y: [B,C,H,W] starting point
-    - v: [B,C,H,W] tangent vector
-    - model: trained UNetSD
-    - scheduler: VPScheduler
-    - t_idx: diffusion timestep
-    - train_images: optional dataset for nearest neighbor
-    - beta: Riemannian metric parameters
-    - n_substeps: number of substeps
-    - correct_every: how often to apply diffusion-based correction
-    """
-    y_current = y
+def levi_civita_exp_map(y, v, model, scheduler, t_idx, beta=1.0, n_substeps=8):
+    y_curr = y.clone()
     dx = v / n_substeps
+    for _ in range(n_substeps):
+        s = score_fn(y_curr, model, scheduler, t_idx)
+        s_flat = s.flatten(1)
+        dx_flat = dx.flatten(1)
+        s_dot_dx = (s_flat * dx_flat).sum(dim=1, keepdim=True)
+        s_norm2 = (s_flat * s_flat).sum(dim=1, keepdim=True)
+        factor = beta * s_dot_dx / (1 + beta * s_norm2)
+        ginv_dx_flat = dx_flat - factor * s_flat
+        ginv_dx = ginv_dx_flat.view_as(y_curr)
+        y_curr = y_curr + ginv_dx
+    return y_curr
 
-    for step in range(n_substeps):
-        # Compute score
-        s = score_fn(y_current, model, scheduler, t_idx)  # [B,C,H,W]
-
-        if beta != 0:
-            # Optional: nearest training point
-            if train_images is not None:
-                y_target = find_nearest_training_point(y_current, train_images)
-            else:
-                y_target = torch.zeros_like(y_current)
-    
-            # Path integral factor
-            Phi_val = linear_path_integral_fast(y_current, y_target, model, scheduler, t_idx)  # [B]
-            C = torch.exp(beta * Phi_val).view(-1, 1, 1, 1)  # broadcast
-        else:
-            C = 1
-
-        # Riemannian metric step
-        s_norm2 = (s * s).view(s.shape[0], -1).sum(dim=1, keepdim=True)  # [B,1]
-        proj = (s * dx).view(s.shape[0], -1).sum(dim=1, keepdim=True)    # [B,1]
-        denom = 1 + C * s_norm2
-        ginv_dx = dx - C * (proj / denom).view(-1,1,1,1) * s
-        y_current = y_current + ginv_dx
-      
-    return y_current
-    
 # ------------------------
-# Log map shooting with new metric
+# Levi-Civita Log Map Shooting
 # ------------------------
 @torch.no_grad()
-def log_map_shooting(y, y_target, model, scheduler, t_idx, beta=0.0, max_iters=1000, lr=0.1, n_substeps_schedule=[1,2,4,8], train_images=None):
-    z=torch.norm(y-y_target)
+def levi_civita_log_map(y, y_target, model, scheduler, t_idx,
+                        beta=1.0, n_substeps_schedule=[1,2,4,8], max_iters=500, lr=0.1):
     y = y.detach().clone()
     y_target = y_target.detach().clone()
-    tol = 1e-1
+    tol = 1e-3
     momentum_gamma = 0.9
-    #print(torch.norm(y-y_target))
-    
-    v = (y_target - y).detach().clone()
+    v = (y_target - y).clone().detach()
     v.requires_grad_(True)
-    #print(torch.norm(v))
-    
     momentum = torch.zeros_like(v)
     best_v = v.clone()
     best_loss = float('inf')
-
-    for idx, n_substeps in enumerate(n_substeps_schedule):
+    for n_substeps in n_substeps_schedule:
         n_iters = max_iters // len(n_substeps_schedule)
-        V = best_v
-        #print(torch.norm(y-y_target))
         for i in range(n_iters):
-            #print(torch.norm(y-y_target))
-            y_pred = exp_map(y.detach().clone(), v.detach().clone(), model, scheduler, t_idx, beta=beta, n_substeps=n_substeps, train_images=train_images)
+            y_pred = levi_civita_exp_map(y, v, model, scheduler, t_idx, beta=beta, n_substeps=n_substeps)
             residual = y_target - y_pred
-
             loss = residual.norm()**2
-            
             if loss.item() < tol:
                 break
-            
-            # normalize residual to prevent huge jumps
             step = lr * residual / (residual.norm() + 1e-8)
-
-            # apply momentum
             momentum = momentum_gamma * momentum + step
             v = v + momentum
-
-            # track best v only at the **max substeps stage**
             if n_substeps == n_substeps_schedule[-1] and loss.item() < best_loss:
                 best_loss = loss.item()
                 best_v = v.clone()
-
     return best_v
 
 # ------------------------
@@ -369,139 +257,69 @@ def load_image(path, image_size=64):
     img = Image.open(path).convert("RGB")
     return transform(img).unsqueeze(0)
 
-#@torch.no_grad()
-def Phi(y, model, scheduler, num_steps=50, eta=0.0, t_idx=0):
-    """
-    Map noise y -> image x using DDIM deterministic sampling.
-    y: input noise tensor [B,C,H,W]
-    """
-    # Define timesteps for DDIM
-    timesteps = torch.linspace(scheduler.num_timesteps-t_idx-1, 0, scheduler.num_timesteps-t_idx, dtype=torch.long)
-    x = ddim_sample(model, scheduler, y, timesteps, eta=eta)
-    return x
-    
 # ------------------------
-# Dataset
+# Confidence Metric
 # ------------------------
-class CelebAHQDataset(Dataset):
-    def __init__(self, root_dir, image_size=64):
-        self.root_dir = root_dir
-        self.image_paths = [os.path.join(root_dir, f) for f in os.listdir(root_dir)
-                            if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3)
-        ])
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        image = Image.open(self.image_paths[idx]).convert("RGB")
-        return self.transform(image)
-
-# ------------------------
-# Compute expected primitive
-# ------------------------
-@torch.no_grad() 
-def expected_primitive(z0, Z, Phi_fn, log_map_fn, exp_map_fn, eps, max_iter=200, lr=0.01):
-    z_t = z0.clone()
-
-    for t in range(max_iter):
-        print(t)
-        grad = torch.zeros_like(z_t)  # initialize gradient for this iteration
-    
-        # Loop over all samples in Z
-        for i in range(Z.shape[0]):
-            Phi_zt = Phi_fn(z_t)     # [1, C, H, W]
-            Phi_Zi = Phi_fn(Z[i:i+1])  # [1, C, H, W], keep batch dim
-            print(torch.norm(Phi_zt-Phi_Zi))
-            
-            logs = log_map_fn(Phi_zt, Phi_Zi)  # [1, C, H, W]
-    
-            zt_norm2 = (z_t ** 2).sum()
-            zi_norm2 = (Z[i:i+1] ** 2).sum()
-    
-            w = torch.exp(0.5 * (zt_norm2 - zi_norm2))  # scalar
-    
-            grad -= 2 * w * logs  # accumulate gradient
-    
-        # Gradient descent step
-        z_next = z_t - lr * grad
-    
-        # Check e-ball constraint
-        diff = z_next - z0
-        if diff.view(-1).norm() >= eps:
-            print(f"Stopped at iter {t} because left e-ball.")
-            z_next = z_t
-            break
-    
-        z_t = z_next
-    
-    return z_t
-  
-# ------------------------
-# Compute confidence metric
-# ------------------------
+@torch.no_grad()
 def confidence_metric(
-    z: torch.Tensor,            # latent space point x
-    Phi_fn,                      # diffusion model: latent -> image space
-    log_map_fn,                  # logarithmic map for geodesic distance
-    exp_map_fn,                  # exponential map
-    eps: float = 1.0,            # radius for the e-ball
-    N: int = 400,                # Monte Carlo samples
-    max_iter: int = 200,         # max iterations for expected primitive
-    lr: float = 0.01             # learning rate for expected primitive
+    z: torch.Tensor,
+    Phi_fn,
+    log_map_fn,
+    exp_map_fn,
+    eps: float = 1.0,
+    N: int = 16,
+    max_iter: int = 200,
+    lr: float = 0.01
 ):
     device = z.device
-
-    def sample_ball(z0, eps, N):
-        shape = z0.shape
-        d = z0.numel() // z0.shape[0]  # flattened dimension per sample
-        # Generate random directions
-        u = torch.randn(N, *shape[1:], device=z0.device)
-        u = u.view(N, -1)
-        # Normalize each vector to have norm 1
-        u = u / u.norm(dim=1, keepdim=True)
-        # Scale by eps
-        u = eps * u
-        # Reshape back and add to z0
-        return z0 + u.view(N, *shape[1:])
-
-    Z = sample_ball(z, eps, N)
-    
-    y_star = expected_primitive(z0=z, Z=Z, Phi_fn=Phi_fn, log_map_fn=log_map_fn, exp_map_fn=exp_map_fn, eps=eps, max_iter=max_iter, lr=lr)
-
+    # Sample e-ball
+    shape = z.shape
+    d = z.numel() // z.shape[0]
+    u = torch.randn(N, *shape[1:], device=device).view(N, -1)
+    u = u / u.norm(dim=1, keepdim=True) * eps
+    Z = z + u.view(N, *shape[1:])
+    # Expected primitive
+    z_t = z.clone()
+    for t in range(max_iter):
+        grad = torch.zeros_like(z_t)
+        for i in range(N):
+            Phi_zt = Phi_fn(z_t)
+            Phi_Zi = Phi_fn(Z[i:i+1])
+            logs = log_map_fn(Phi_zt, Phi_Zi)
+            zt_norm2 = (z_t**2).sum()
+            Zi_norm2 = (Z[i:i+1]**2).sum()
+            w = torch.exp(0.5 * (zt_norm2 - Zi_norm2))
+            grad -= 2 * w * logs
+        z_next = z_t - lr * grad
+        if (z_next - z).view(-1).norm() >= eps:
+            z_next = z_t
+            break
+        z_t = z_next
+    y_star = z_t
+    # Geodesic distances
     geodesic_dists = []
     for i in range(N):
         log_i = log_map_fn(y_star, Z[i:i+1])
         dist_i = (log_i**2).sum().item()
         geodesic_dists.append(dist_i)
     geodesic_dists = torch.tensor(geodesic_dists, device=device)
-
-    # Distance from center to expected primitive
     log_center = log_map_fn(Phi_fn(y_star), Phi_fn(z))
     dist_center = (log_center**2).sum().item()
-
     z_star_norm = (y_star**2).sum()
     Z_norm = (Z**2).view(N, -1).sum(dim=1)
     weights = torch.exp(0.5 * (z_star_norm - Z_norm))
     var_R = (weights * geodesic_dists).mean().item()
-
-    C = torch.log(torch.tensor(var_R)) + dist_center**2 / (var_R+1e-5)
-
+    C = torch.log(torch.tensor(var_R)) + dist_center**2 / (var_R + 1e-5)
     return C.item(), var_R, dist_center
 
+# ------------------------
+# Main
+# ------------------------
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # -------------------------
-    # Load model + scheduler
-    # -------------------------
+    device = "cpu"  # or "cuda" if available
+    # Load model
     model = UNetSD().to(device)
     scheduler = VPScheduler(num_timesteps=1000)
-
     checkpoint_path = "/data5/accounts/marsh/Diffusion/vp_diffusion_outputs/unet_epoch_2000.pt"
     if os.path.isfile(checkpoint_path):
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -510,77 +328,49 @@ def main():
         print("Checkpoint not found. Using random weights.")
     model.eval()
 
-    # -------------------------
-    # Settings
-    # -------------------------
     t_idx = 400
     beta = -10.0
-    eps = 0.5      # epsilon value for the ball
-    N = 16         # Number of samples for Monte Carlo
-    num_samples = 16  # Number of initial random samples
-
+    eps = 0.5
+    N = 16
+    num_samples = 16
     os.makedirs("confidences", exist_ok=True)
 
-    # -------------------------
-    # Wrappers
-    # -------------------------
     Phi_fn = lambda z: ddim_sample(
         model, scheduler, z,
         torch.linspace(1000-t_idx-1, 0, 1000-t_idx, dtype=torch.long)
     )
+    log_map_fn = lambda x, y: levi_civita_log_map(
+        y=x, y_target=y,
+        model=model, scheduler=scheduler,
+        t_idx=t_idx, beta=beta
+    )
+    exp_map_fn = lambda x, v: levi_civita_exp_map(
+        y=x, v=v,
+        model=model, scheduler=scheduler,
+        t_idx=t_idx, beta=beta
+    )
 
-    def log_map_fn(x, y):
-        return log_map_shooting(
-            y=x, y_target=y,
-            model=model, max_iters=1000, scheduler=scheduler,
-            t_idx=t_idx, beta=beta,
-        )
+    imgs, confidence_values = [], []
 
-    def exp_map_fn(x, v):
-        return exp_map(
-            x, v,
-            model=model, scheduler=scheduler,
-            t_idx=t_idx, beta=beta
-        )
-
-    # List to hold the images and confidence values
-    imgs = []
-    confidence_values = []
-
-    # Loop to generate 16 random samples and compute the confidence metric
     for i in range(num_samples):
-        # 1. Choose center z0
         z0 = torch.randn(1, 3, 64, 64, device=device)
-    
-        # 3. Compute confidence metric
         confidence, _, _ = confidence_metric(
-            z=z0,
-            Phi_fn=Phi_fn,
+            z=z0, Phi_fn=Phi_fn,
             log_map_fn=log_map_fn,
             exp_map_fn=exp_map_fn,
-            eps=eps,
-            N=N,
-            max_iter=2,
-            lr=0.01
+            eps=eps, N=N, max_iter=2, lr=0.01
         )
         confidence_values.append(confidence)
+        imgs.append((ddim_sample(model, scheduler, z0, torch.linspace(999, 0, 1000, dtype=torch.long))[0] * 0.5 + 0.5).clamp(0,1))
 
-        # Convert to image
-        def to_img(tensor):
-            return (tensor[0] * 0.5 + 0.5).clamp(0,1).cpu()
-
-        imgs.append(to_img(ddim_sample(model, scheduler, z0, torch.linspace(999, 0, 1000, dtype=torch.long))))
-
-    # Plot all the images in a 4x4 grid
-    fig, axes = plt.subplots(4, 4, figsize=(12, 12))  # Create a 4x4 grid
-    for i, (img, confidence) in enumerate(zip(imgs, confidence_values)):
-        ax = axes[i // 4, i % 4]  # Calculate row and column index for 4x4 grid
+    # Plot 4x4 grid
+    fig, axes = plt.subplots(4, 4, figsize=(12,12))
+    for i, (img, conf) in enumerate(zip(imgs, confidence_values)):
+        ax = axes[i//4, i%4]
         ax.imshow(transforms.ToPILImage()(img))
         ax.axis('off')
-        ax.set_title(f"Score: {confidence:.4f}", fontsize=10)
-    
+        ax.set_title(f"Score: {conf:.4f}", fontsize=10)
     plt.tight_layout()
-    plt.subplots_adjust(top=0.95)
     out_path = "confidences/epsilon_0.1_all_samples_with_confidence.png"
     plt.savefig(out_path)
     plt.close(fig)
