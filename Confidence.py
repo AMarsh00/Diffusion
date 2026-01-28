@@ -357,148 +357,124 @@ def confidence_metric(
 def main():
     device="cpu" # or cuda if available
     t_idx = 400
-    beta_values = [-50.0, -25.0, -10.0, -5.0, -2.5, -1.0, 0]
-    n_geo_steps = 10
-    all_geodesics = {}
-    lam = 1e6
+    beta = -5.0
     num_samples = 16
     eps = 0.1
-    beta = -5.0
+    
     # Load model & scheduler
     model = UNetSD().to(device)
     scheduler = VPScheduler(num_timesteps=1000)
-    checkpoint_path = "/data5/accounts/marsh/Diffusion/vp_diffusion_outputs/unet_epoch_2000.pt" # Replace with your path
+    checkpoint_path = "/data5/accounts/marsh/Diffusion/vp_diffusion_outputs/unet_epoch_2000.pt" # Replace with your filepath
     if os.path.isfile(checkpoint_path):
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         print("Loaded trained model.")
     else:
         print("Checkpoint not found. Using random weights.")
     model.eval()
-
-    # ------------------------
-    # Timesteps for DDIM
-    # ------------------------
-    timesteps = torch.linspace(1000-t_idx-1, 0, 1000-t_idx, dtype=torch.long, device=device)
-
-    # ------------------------
-    # Phi_fn, log_map_fn, exp_map_fn
-    # ------------------------
-    Phi_fn = lambda z: ddim_sample(model, scheduler, z, timesteps, eta=0.0)
-    log_map_fn = lambda x, y: levi_civita_log_map(
-        Y=x, Y_target=y, model=model, scheduler=scheduler, t_idx=t_idx, beta=beta
-    )
-    exp_map_fn = lambda x, v: levi_civita_exp_map(
-        y=x, v=v, model=model, scheduler=scheduler, t_idx=t_idx, beta=beta
-    )
-
-    # ------------------------
-    # Generate batch of random z0
-    # ------------------------
-    z0 = torch.randn(num_samples, 3, 64, 64, device=device)  # [N, C, H, W]
-
-    # ------------------------
-    # Sample N points on epsilon-ball (for confidence)
-    # ------------------------
-    N = 16
-    u = torch.randn(N, num_samples, 3, 64, 64, device=device)
-    u = eps * u / (u.view(N, num_samples, -1).norm(dim=2).view(N, num_samples, 1, 1, 1) + 1e-8)
-    Z = z0.unsqueeze(0) + u  # [N, num_samples, C, H, W]
-
-    # Flatten for batch processing
-    Z_flat = Z.view(N * num_samples, 3, 64, 64)
-
-    # Precompute Phi(Z) for all N*num_samples points
-    Phi_Z_flat = Phi_fn(Z_flat)
-    Phi_Z = Phi_Z_flat.view(N, num_samples, 3, 64, 64)
-
-    # ------------------------
-    # Confidence metric vectorized
-    # ------------------------
-    max_iter = 2
-    lr = 0.05
-    tol = 1e-3
-
-    z_t = z0.clone()
-    for _ in range(max_iter):
-        z_t_exp = z_t.unsqueeze(0).expand(N, -1, -1, -1, -1)  # [N, num_samples, C, H, W]
-        z_t_flat = z_t_exp.reshape(N*num_samples, 3, 64, 64)
-        Phi_zt_flat = Phi_fn(z_t_flat)
-        Phi_zt = Phi_zt_flat.view(N, num_samples, 3, 64, 64)
-
-        # Compute log maps
-        logs = torch.zeros_like(Phi_zt)
-
-        for i in range(num_samples):
-            # Each call sees [N, C, H, W]
-            logs[:, i] = log_map_fn(
-                Phi_zt[:, i],   # [N, C, H, W]
-                Phi_Z[:, i]     # [N, C, H, W]
-            )
-
-        # Weighting
-        zt_norm2 = (z_t**2).sum()
-        Z_norm2 = (Z_flat**2).view(N, num_samples, -1).sum(dim=2)
-        w = torch.exp(0.5 * (zt_norm2 - Z_norm2)).view(N, num_samples, 1, 1, 1)
-
-        # Gradient step (vectorized)
-        grad = -2 * (w * logs).mean(dim=0)  # Average over N
-        z_next = z_t - lr * grad
-
-        if (z_next - z_t).view(-1).norm() < tol:
-            break
-        z_t = z_next
-
-    y_star = z_t
-
-    # Compute geodesic distances
-    y_star_exp = y_star.unsqueeze(0).expand(N, -1, -1, -1, -1)
-    log_vec = torch.zeros_like(Z)
-
-    for i in range(num_samples):
-        log_vec[:, i] = log_map_fn(
-            y_star_exp[:, i],  # [N, C, H, W]
-            Z[:, i]            # [N, C, H, W]
-        )
-    geodesic_dists = (log_vec.view(N, num_samples, -1)**2).sum(dim=2)
-
-    dist_center = torch.zeros(num_samples, device=device)
-
-    for i in range(num_samples):
-        phi_y = Phi_fn(y_star[i:i+1])   # [1, C, H, W]
-        phi_z = Phi_fn(z0[i:i+1])       # [1, C, H, W]
     
-        log_c = log_map_fn(phi_y, phi_z)  # [1, C, H, W]
-        dist_center[i] = (log_c**2).sum()
-        
-    dist_center = dist_center.cpu().numpy()
-
-    z_star_norm = (y_star**2).sum()
-    Z_norm = (Z**2).view(N, -1).sum(dim=1)
-    weights = torch.exp(0.5 * (z_star_norm - Z_norm))
-    var_R = (weights * geodesic_dists).mean().item()
-    C = torch.log(torch.tensor(var_R)) + dist_center**2 / (var_R + 1e-5)
-
+    # Timesteps for DDIM
+    timesteps = torch.linspace(1000-t_idx-1, 0, 1000-t_idx, dtype=torch.long, device=device)
+    
+    # Phi_fn, log_map_fn, exp_map_fn
+    Phi_fn = lambda z: ddim_sample(model, scheduler, z, timesteps, eta=0.0)
+    log_map_fn = lambda x, y: levi_civita_log_map(Y=x, Y_target=y, model=model, scheduler=scheduler, t_idx=t_idx, beta=beta)
+    exp_map_fn = lambda x, v: levi_civita_exp_map(y=x, v=v, model=model, scheduler=scheduler, t_idx=t_idx, beta=beta)
+    
+    # Generate batch of random z0
+    z0_batch = torch.randn(num_samples, 3, 64, 64, device=device)  # [num_samples, C, H, W]
+    
+    # Placeholder for confidence scores
+    C_all = []
+    
+    for i in range(num_samples):
+        z0 = z0_batch[i:i+1]  # single sample
+    
+        # Sample N points on epsilon-ball
+        N = 16
+        u = torch.randn(N, 3, 64, 64, device=device)
+        u = eps * u / (u.view(N, -1).norm(dim=1).view(N, 1, 1, 1) + 1e-8)
+        Z = z0 + u  # [N, C, H, W]
+    
+        # Precompute Phi(Z)
+        Phi_Z = Phi_fn(Z)
+    
+        # Confidence metric iterations
+        max_iter = 2
+        lr = 0.05
+        tol = 1e-3
+    
+        z_t = z0.clone()
+        for _ in range(max_iter):
+            z_t_exp = z_t.expand(N, -1, -1, -1)  # [N, C, H, W]
+            Phi_zt = Phi_fn(z_t_exp)
+    
+            # Compute log maps
+            logs = log_map_fn(Phi_zt, Phi_Z)
+    
+            # Weighting
+            zt_norm2 = (z_t**2).sum()
+            Z_norm2 = (Z**2).view(N, -1).sum(dim=1)
+            w = torch.exp(0.5 * (zt_norm2 - Z_norm2)).view(N, 1, 1, 1)
+    
+            # Gradient step
+            grad = -2 * (w * logs).mean(dim=0, keepdim=True)
+            z_next = z_t - lr * grad
+    
+            if (z_next - z_t).view(-1).norm() < tol:
+                break
+            z_t = z_next
+    
+        y_star = z_t
+    
+        # Geodesic distances
+        log_vec = log_map_fn(y_star.expand(N, -1, -1, -1), Z)
+        geodesic_dists = (log_vec.view(N, -1)**2).sum(dim=1)
+    
+        # Distance to original center
+        phi_y = Phi_fn(y_star)
+        phi_z = Phi_fn(z0)
+        log_c = log_map_fn(phi_y, phi_z)
+        dist_center = (log_c**2).sum().item()
+    
+        # Variance term
+        z_star_norm = (y_star**2).sum()
+        Z_norm = (Z**2).view(N, -1).sum(dim=1)
+        weights = torch.exp(0.5 * (z_star_norm - Z_norm))
+        var_R = (weights * geodesic_dists).mean().item()
+    
+        # Confidence score
+        C = np.log(var_R + 1e-8) + dist_center**2 / (var_R + 1e-5)
+        C_all.append(C)
+    
+    C_all = np.array(C_all)
+    print("Confidence scores:", C_all)
+    
     # ------------------------
     # Generate final DDIM samples for visualization
     # ------------------------
-    samples = ddim_sample(model, scheduler, z0, torch.linspace(999,0,1000,dtype=torch.long, device=device))
-    samples = (samples * 0.5 + 0.5).clamp(0,1)
-
-    # Plot 4x4 grid
+    samples = ddim_sample(
+        model, scheduler, z0_batch, 
+        torch.linspace(999, 0, 1000, dtype=torch.long, device=device)
+    )
+    samples = (samples * 0.5 + 0.5).clamp(0, 1)  # [0,1] range for plotting
+    
+    # Plot 4x4 grid (for 16 samples)
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(4, 4, figsize=(12,12))
+    fig, axes = plt.subplots(4, 4, figsize=(12, 12))
     for i in range(num_samples):
-        ax = axes[i//4, i%4]
-        img = transforms.ToPILImage()(samples[i])
+        ax = axes[i // 4, i % 4]
+        img = transforms.ToPILImage()(samples[i].cpu())
         ax.imshow(img)
         ax.axis('off')
-        ax.set_title(f"Score: {C[i]:.4f}", fontsize=10)
+        ax.set_title(f"Score: {C_all[i]:.4f}", fontsize=10)
+    
     plt.tight_layout()
     os.makedirs("confidences", exist_ok=True)
     out_path = "confidences/epsilon_batch_samples.png"
     plt.savefig(out_path)
     plt.close(fig)
     print(f"Saved batch plot to {out_path}")
+
 
 if __name__ == "__main__":
     main()
