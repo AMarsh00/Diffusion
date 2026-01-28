@@ -265,93 +265,59 @@ def linear_path_integral_fast(y, y_target, model, scheduler, t_idx, n_steps=16):
 # Exponential map with our metric
 # ------------------------
 @torch.no_grad()
-def exp_map(y, v, model, scheduler, t_idx, train_images=None, beta=0.0, n_substeps=8, correct_every=1):
+def exp_map(y, v, model, scheduler, t_idx,
+                         lam=1000.0, beta=0.0, n_substeps=8):
     """
-    Exponential map along tangent vector `v` with score correction using the diffusion model.
-
-    Parameters:
-    - y: [B,C,H,W] starting point
-    - v: [B,C,H,W] tangent vector
-    - model: trained UNetSD
-    - scheduler: VPScheduler
-    - t_idx: diffusion timestep
-    - train_images: optional dataset for nearest neighbor
-    - beta: Riemannian metric parameters
-    - n_substeps: number of substeps
-    - correct_every: how often to apply diffusion-based correction
+    Levi-Civita exponential map along tangent vector v.
+    y: [B,C,H,W] starting point
+    v: [B,C,H,W] tangent vector
     """
     y_current = y
     dx = v / n_substeps
 
     for step in range(n_substeps):
-        # Compute score
+        # score-based metric
         s = score_fn(y_current, model, scheduler, t_idx)  # [B,C,H,W]
 
-        if beta != 0:
-            # Optional: nearest training point
-            if train_images is not None:
-                y_target = find_nearest_training_point(y_current, train_images)
-            else:
-                y_target = torch.zeros_like(y_current)
-    
-            # Path integral factor
-            Phi_val = linear_path_integral_fast(y_current, y_target, model, scheduler, t_idx)  # [B]
-            C = torch.exp(beta * Phi_val).view(-1, 1, 1, 1)  # broadcast
-        else:
-            C = 1
+        # Metric: g = I + lam * s s^T
+        s_flat = s.flatten(1)
+        dx_flat = dx.flatten(1)
+        denom = 1 + lam * (s_flat * s_flat).sum(dim=1, keepdim=True)  # [B,1]
 
-        # Riemannian metric step
-        s_norm2 = (s * s).view(s.shape[0], -1).sum(dim=1, keepdim=True)  # [B,1]
-        proj = (s * dx).view(s.shape[0], -1).sum(dim=1, keepdim=True)    # [B,1]
-        denom = 1 + C * s_norm2
-        ginv_dx = dx - C * (proj / denom).view(-1,1,1,1) * s
-        y_current = y_current + ginv_dx#C * ginv_dx
+        # Levi-Civita step: g^{-1} dx
+        proj = (s_flat * dx_flat).sum(dim=1, keepdim=True)  # [B,1]
+        dx_corr = dx_flat - lam * (proj / denom) * s_flat  # [B,D]
+        dx_corr = dx_corr.view_as(dx)
+
+        y_current = y_current + dx_corr
 
     return y_current
-    
-# ------------------------
-# Log map shooting with our metric
-# ------------------------
+
 @torch.no_grad()
-def log_map_shooting(y, y_target, model, scheduler, t_idx, beta=0.0, max_iters=1000, lr=0.1, n_substeps_schedule=[1,2,4,8], train_images=None):
-    z=torch.norm(y-y_target)
-    y = y.detach().clone()
-    y_target = y_target.detach().clone()
-    tol = 1e-1
-    momentum_gamma = 0.9
-    
+def log_map_shooting(y, y_target, model, scheduler, t_idx,
+                         lam=1000.0, beta=0.0, max_iters=50, lr=0.5):
+    """
+    Levi-Civita logarithmic map via iterative shooting.
+    Returns tangent vector v such that exp_map(y, v) approx y_target
+    """
     v = (y_target - y).detach().clone()
-    v.requires_grad_(True)
-    
+    momentum_gamma = 0.9
     momentum = torch.zeros_like(v)
-    best_v = v.clone()
-    best_loss = float('inf')
 
-    for idx, n_substeps in enumerate(n_substeps_schedule):
-        n_iters = max_iters // len(n_substeps_schedule)
-        V = best_v
-        for i in range(n_iters):
-            y_pred = exp_map(y.detach().clone(), v.detach().clone(), model, scheduler, t_idx, beta=beta, n_substeps=n_substeps, train_images=train_images)
-            residual = y_target - y_pred
+    for it in range(max_iters):
+        y_pred = exp_map(y, v, model, scheduler, t_idx, lam=lam)
+        residual = y_target - y_pred
 
-            loss = residual.norm()**2
-            
-            if loss.item() < tol:
-                break
-            
-            # normalize residual to prevent huge jumps
-            step = lr * residual / (residual.norm() + 1e-8)
+        loss = (residual ** 2).sum()
+        if loss < 1e-5:
+            break
 
-            # apply momentum
-            momentum = momentum_gamma * momentum + step
-            v = v + momentum
+        # update tangent with momentum
+        step = lr * residual / (residual.norm() + 1e-8)
+        momentum = momentum_gamma * momentum + step
+        v = v + momentum
 
-            # track best v only at the **max substeps stage**
-            if n_substeps == n_substeps_schedule[-1] and loss.item() < best_loss:
-                best_loss = loss.item()
-                best_v = v.clone()
-
-    return best_v
+    return v
 
 # ------------------------
 # Image helpers
