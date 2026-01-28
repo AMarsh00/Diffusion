@@ -1,7 +1,7 @@
 """
 High_Confidence_Curves.py
 Alexander Marsh
-3 January 2026
+27 January 2026
 
 Computes a high-confidence curve interpolation between two random generations from the CelebA-HQ model.
 """
