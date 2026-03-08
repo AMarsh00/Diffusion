@@ -1,7 +1,7 @@
 """
 Geodesics.py
 Alexander Marsh
-27 January 2026
+7 March 2026
 
 Computes geodesics between random generations of the CelebA-HQ diffusion model with our metric for various values of theta.
 """
