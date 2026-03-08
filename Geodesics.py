@@ -196,60 +196,68 @@ def score_fn(x, model, scheduler, t):
     return score
 
 # ------------------------
-# Levi-Civita
+# Path-Integral Metric & Levi-Civita
 # ------------------------
-def levi_civita_exp_map(
-    x0,
-    v0,
-    model,
-    scheduler,
-    t_idx,
-    beta=1.0,
-    n_steps=50,
-    step_size=0.05,
-):
+def path_integral_metric(x, model, scheduler, t_idx, x_ind=None, beta=1.0, n_steps_int=10):
+    """
+    Compute G = I + exp(beta * integral) * (score score^T)
+    x: [dim] tensor
+    x_ind: reference point for integral (default origin)
+    n_steps_int: number of steps to discretize path integral
+    """
+    if x_ind is None:
+        x_ind = torch.zeros_like(x)
 
-    x = x0.clone()
-    v = v0.clone()
+    dx = (x - x_ind) / n_steps_int
+    integral = 0.0
+    xk = x_ind.clone().detach()
+
+    for _ in range(n_steps_int):
+        s = score_fn(xk, model, scheduler, t_idx)  # score at xk
+        integral += torch.dot(s.view(-1), dx.view(-1))
+        xk = xk + dx
+
+    s_x = score_fn(x, model, scheduler, t_idx).view(-1, 1)
+    G = torch.eye(len(x), device=x.device) + torch.exp(beta * integral) * (s_x @ s_x.T)
+    return G
+
+def levi_civita_exp_map(x, v, model, scheduler, t_idx, beta=1.0, x_ind=None, n_steps=10, n_steps_int=10):
+    """
+    Levi-Civita exponential map using path-integral metric with Sherman-Morrison
+    """
+    x_curr = x.clone().detach()
+    v_step = v / n_steps
 
     for _ in range(n_steps):
+        # Compute metric (rank-1)
+        if x_ind is None:
+            x_ind = torch.zeros_like(x_curr)
 
-        x.requires_grad_(True)
+        dx_int = (x_curr - x_ind) / n_steps_int
+        #integral = 0.0
+        #xk = x_ind.clone().detach()
+        #for _ in range(n_steps_int):
+        #    s = score_fn(xk, model, scheduler, t_idx).view(-1)
+        #    integral += torch.dot(s, dx_int.view(-1))
+        #    xk = xk + dx_int
 
-        # score
-        s = score_fn(x, model, scheduler, t_idx)
+        s_x = score_fn(x_curr, model, scheduler, t_idx).view(-1)
+        w = beta#torch.exp(beta * integral)
 
-        # compute score Jacobian-vector product
-        s_flat = s.view(-1)
-        v_flat = v.view(-1)
+        # Solve G dx = v_step via Sherman-Morrison
+        s_dot_s = (s_x**2).sum()
+        s_dot_v = (s_x * v_step.view(-1)).sum()
+        dx = v_step.view(-1) - w * s_x * s_dot_v / (1 + w * s_dot_s)
+        dx = dx.view_as(x_curr)
 
-        Jv = torch.autograd.grad(
-            s_flat,
-            x,
-            grad_outputs=v_flat,
-            retain_graph=False,
-            create_graph=False,
-        )[0]
+        x_curr = x_curr + dx
 
-        s_dot_v = (s * v).sum()
-
-        # Levi-Civita acceleration
-        a = -beta * Jv * s_dot_v
-
-        # velocity update
-        v = v + step_size * a
-
-        # position update
-        x = x + step_size * v
-
-        x = x.detach()
-        v = v.detach()
-
-    return x
+    return x_curr.detach()
 
 # ------------------------
 # Log map shooting
 # ------------------------
+@torch.no_grad()
 def log_map_shooting(y, y_target, model, scheduler, t_idx, beta=1e6, max_iters=1000, lr=0.1, n_substeps_schedule=[1, 2, 4, 8],):
     y = y.detach()
     y_target = y_target.detach()
@@ -354,7 +362,7 @@ def main():
 
     # Timestep for metric
     t_idx = 400
-    beta_values = [-50.0, -25.0, -10.0, -5.0, -2.5, -1.0, 0]
+    beta_values = [0, 1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0]
     n_geo_steps = 10
     all_geodesics = {}
     lam = 1e6
@@ -365,20 +373,13 @@ def main():
 
     for beta in beta_values:
         print(f"Computing bidirectional geodesic for beta={beta}...")
-        v = log_map_shooting(xA2, xB2, model, scheduler, t_idx, beta=beta)
+        v_forward = log_map_shooting(xA2, xB2, model, scheduler, t_idx, beta=beta)
 
         geodesic = []
         for i in range(n_geo_steps):
             s = i / (n_geo_steps - 1)
-        
-            y_s = levi_civita_exp_map(
-                xA2,
-                s * v,
-                model,
-                scheduler,
-                t_idx,
-                beta=beta
-            )
+            y_s = levi_civita_exp_map(xA2, s * v_forward, model, scheduler, t_idx, beta=beta)
+            
             x0_pred = ddim_sample(model, scheduler, y_s,
                                   torch.linspace(t_idx-1, 0, t_idx, dtype=torch.long, device=device))
             geodesic.append(x0_pred.detach().cpu())
