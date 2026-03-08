@@ -196,31 +196,8 @@ def score_fn(x, model, scheduler, t):
     return score
 
 # ------------------------
-# Path-Integral Metric & Levi-Civita
+# Levi-Civita
 # ------------------------
-def path_integral_metric(x, model, scheduler, t_idx, x_ind=None, beta=1.0, n_steps_int=10):
-    """
-    Compute G = I + exp(beta * integral) * (score score^T)
-    x: [dim] tensor
-    x_ind: reference point for integral (default origin)
-    n_steps_int: number of steps to discretize path integral
-    """
-    if x_ind is None:
-        x_ind = torch.zeros_like(x)
-
-    dx = (x - x_ind) / n_steps_int
-    integral = 0.0
-    xk = x_ind.clone().detach()
-
-    for _ in range(n_steps_int):
-        s = score_fn(xk, model, scheduler, t_idx)  # score at xk
-        integral += torch.dot(s.view(-1), dx.view(-1))
-        xk = xk + dx
-
-    s_x = score_fn(x, model, scheduler, t_idx).view(-1, 1)
-    G = torch.eye(len(x), device=x.device) + torch.exp(beta * integral) * (s_x @ s_x.T)
-    return G
-
 def levi_civita_exp_map(x, v, model, scheduler, t_idx, beta=1.0, x_ind=None, n_steps=10, n_steps_int=10):
     """
     Levi-Civita exponential map using path-integral metric with Sherman-Morrison
@@ -234,16 +211,10 @@ def levi_civita_exp_map(x, v, model, scheduler, t_idx, beta=1.0, x_ind=None, n_s
             x_ind = torch.zeros_like(x_curr)
 
         dx_int = (x_curr - x_ind) / n_steps_int
-        integral = 0.0
-        xk = x_ind.clone().detach()
-        for _ in range(n_steps_int):
-            s = score_fn(xk, model, scheduler, t_idx).view(-1)
-            integral += torch.dot(s, dx_int.view(-1))
-            xk = xk + dx_int
-
+        
         s_x = score_fn(x_curr, model, scheduler, t_idx).view(-1)
-        w = torch.exp(beta * integral)
-
+        w = beta
+        
         # Solve G dx = v_step via Sherman-Morrison
         s_dot_s = (s_x**2).sum()
         s_dot_v = (s_x * v_step.view(-1)).sum()
@@ -417,7 +388,7 @@ def main():
         y_offset = row_idx * (height + label_height)
         if font:
             draw = ImageDraw.Draw(final_image)
-            draw.text((0, y_offset), f"theta={beta}", fill=(255,0,0), font=font)
+            draw.text((0, y_offset), f"lambda={beta}", fill=(255,0,0), font=font)
         y_offset += label_height
         for col_idx, frame in enumerate(geodesic):
             img = frame.squeeze(0)
