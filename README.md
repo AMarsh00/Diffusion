@@ -1,10 +1,10 @@
 # Confidence Metric for Diffusion Models
 
-![Python](https://img.shields.io/badge/python-3.13-blue.svg)
-![PyTorch](https://img.shields.io/badge/pytorch-2.1-red.svg)
+![Python](https://img.shields.io/badge/python-3.14-blue.svg)
+![PyTorch](https://img.shields.io/badge/pytorch-2.12-red.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-This repository implements the **confidence metric for diffusion models**, as described in our paper. The code enables computing **high-confidence latent curves**, **geodesic paths**, and reproducing experiments on both real images (CelebA-HQ) and synthetic Gaussian data.  
+This repository implements the **confidence metric for diffusion models**, as described in our paper. The code enables computing **high-confidence latent curves**, **geodesic paths**, and reproducing experiments on both real images (CelebA-HQ, Animal Faces) and synthetic Gaussian data.  
 
 ---
 
