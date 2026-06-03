@@ -459,7 +459,7 @@ def build_geodesic_curve(xA_, xB_, log_map_fn, exp_map_fn, n_steps=10):
     curve = [xA_]
 
     # initial tangent guess
-    v = log_map_fn(xA_, xB_, max_iters=5000) / (n_steps - 1)
+    v = log_map_fn(xA_, xB_, max_iters=1000) / (n_steps - 1)
 
     x = xA_.clone()
 
