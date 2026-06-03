@@ -1,5 +1,5 @@
 """
-Downloads the Animal Faces dataset. I downsized this one in the model training file, so we don't downsize here.
+Downloads the Animal Faces dataset. I downsized this one in the model training file and the experiment files, so we don't downsize here. You could downsize here and not downsize later if you wanted.
 """
 
 import os
