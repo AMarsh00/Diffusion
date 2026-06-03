@@ -1,5 +1,5 @@
 """
-Downloads the Animal Faces dataset and prepares it 
+Downloads the Animal Faces dataset.
 """
 
 import os
