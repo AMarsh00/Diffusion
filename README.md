@@ -6,17 +6,9 @@
 
 Official implementation of **"A Geometrically-Based Confidence Metric for Diffusion Models"**.
 
-This repository introduces a novel confidence metric for diffusion models that provides a geometric measure of how strongly a trained diffusion model supports a given trajectory through image space. Using this metric, we construct high-confidence curves, diffusion geodesics, and optimized interpolation paths between samples.
+This repository introduces a confidence metric for diffusion models and a High-Confidence Curve interpolation based on it, which improves upon current interpolation algorithms.
 
-The framework provides new tools for studying:
-
-* Diffusion model geometry
-* Sample interpolation
-* Learned data manifolds
-* Model confidence and uncertainty
-* Geodesic paths in generative spaces
-
-Experiments are provided for both synthetic and image-based datasets, including CelebA-HQ and AFHQ.
+Experiments and pretrained model weights are provided for both synthetic and image-based datasets, including CelebA-HQ and Animal Faces.
 
 ---
 
@@ -25,14 +17,6 @@ Experiments are provided for both synthetic and image-based datasets, including 
 Traditional interpolation methods often rely on Euclidean line segments between samples, which may traverse regions poorly supported by a diffusion model.
 
 Our confidence metric instead quantifies how well a diffusion model supports a trajectory and enables the construction of paths that remain in regions of high model confidence.
-
-Using this framework, we investigate:
-
-* High-confidence interpolation curves
-* Diffusion geodesics
-* Nudged Elastic Band (NEB) optimization
-* Expected primitive updates
-* Geometric structure of diffusion-generated manifolds
 
 ---
 
@@ -55,11 +39,14 @@ Using this framework, we investigate:
 │   └── High_Confidence_Curves.py
 │
 ├── Models/
+|   └── Train_Model_Animal_Faces.py
+|   └── Train_Model_CelebA.py
 │   └── Model_Weights/
 │       ├── unet_epoch_2000.pt
 │       └── unet_animal_epoch_2000.pt
 │
 ├── requirements.txt
+├── LICENSE
 └── README.md
 ```
 
@@ -71,9 +58,9 @@ Using this framework, we investigate:
 
 The repository includes scripts for downloading and preparing the CelebA-HQ dataset at 64×64 resolution.
 
-## AFHQ (Animal Faces)
+## Animal Faces
 
-Scripts are also provided for downloading and preparing the AFHQ dataset.
+Scripts are also provided for downloading and preparing the Animal Faces dataset.
 
 Prepared datasets are used to reproduce the experiments reported in the paper.
 
@@ -83,12 +70,12 @@ Prepared datasets are used to reproduce the experiments reported in the paper.
 
 Pretrained diffusion model checkpoints are provided for reproducing experiments without retraining.
 
-| Checkpoint                  | Dataset   | Resolution |
-| --------------------------- | --------- | ---------- |
-| `unet_epoch_2000.pt`        | CelebA-HQ | 64×64      |
-| `unet_animal_epoch_2000.pt` | AFHQ      | 64×64      |
+| Checkpoint                  | Dataset       | Resolution |
+| --------------------------- | ------------- | ---------- |
+| `unet_epoch_2000.pt`        | CelebA-HQ     | 64×64      |
+| `unet_animal_epoch_2000.pt` | Animal Faces  | 64×64      |
 
-Place model checkpoints in:
+Model checkpoints available in
 
 ```text
 Models/Model_Weights/
@@ -155,22 +142,6 @@ python 2D_Examples/High_Confidence_Curves.py
 ```
 
 These scripts reproduce the two-dimensional Gaussian experiments presented in the paper.
-
----
-
-# Methodology
-
-Given a trained diffusion model, we define a confidence metric that quantifies how strongly the model supports a point or trajectory within the learned data manifold.
-
-The metric can be used to:
-
-* Evaluate interpolation quality
-* Construct confidence-maximizing paths
-* Analyze diffusion model geometry
-* Identify regions of low model support
-* Compute diffusion geodesics
-
-Unlike Euclidean interpolation, the resulting trajectories remain closer to regions preferred by the generative model.
 
 ---
 
