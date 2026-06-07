@@ -498,8 +498,8 @@ def main():
     print("Inverting Image B (Cat)...")
     xB_ = ddim_invert(model, scheduler, x0_B, num_steps=1000)
 
-    xA = Phi(xA_, model, scheduler, num_steps=100)
-    xB = Phi(xB_, model, scheduler, num_steps=100)
+    xA = Phi(xA_, model, scheduler, num_steps=1000)
+    xB = Phi(xB_, model, scheduler, num_steps=1000)
 
     t_idx = 400
     lambda = 1000000.0
