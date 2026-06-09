@@ -412,8 +412,6 @@ def plot_curve_images(curves, Phi_fn, title="High-Confidence Curve"):
                 transforms.ToPILImage()(imgs[j].cpu())
             )
             axes[i, j].axis("off")
-            if i == 0:
-                axes[i, j].set_title(f"s={j}")
 
     plt.suptitle(title)
     plt.tight_layout()
