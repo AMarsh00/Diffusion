@@ -281,8 +281,10 @@ def frechet_energy(
 # Generator-constrained expected primitive / Frechet mean
 # ============================================================
 def expected_primitive(
-    samples,
-    weights,
+    rng,
+    localization_center,
+    epsilon,
+    N,
     z_init,
     metric_lambda=1.0,
     step_size=0.20,
@@ -293,31 +295,77 @@ def expected_primitive(
     shooting_iters=60,
     shooting_lr=0.5,
     grad_tol=1e-7,
+    eval_samples=None,
+    eval_weights=None,
 ):
     r"""
-    Minimize the fixed empirical localized Frechet objective
+    Stochastic optimization of the localized Frechet objective.
 
-        F(z) = sum_i w_i d_g(z, Z_i)^2.
+    At EVERY outer iteration q we redraw
+
+        Z_i^(q) ~ N(localization_center, epsilon^2 I)
+
+    and recompute the normalized importance weights
+
+        w_i^(q) proportional to exp(-||Z_i^(q)||^2 / 2).
+
+    For the current batch, define
+
+        F_q(z) = sum_i w_i^(q) d_g(z, Z_i^(q))^2.
 
     Here Phi=Id.  If
 
-        Delta(z) = sum_i w_i Log_z(Z_i),
+        Delta_q(z) = sum_i w_i^(q) Log_z(Z_i^(q)),
 
     then
 
-        grad_g F = -2 Delta,
-        grad_Euclidean F = -2 g(z) Delta.
+        grad_g F_q = -2 Delta_q,
+        grad_Euclidean F_q = -2 g(z) Delta_q.
 
-    Hence d(z)=g(z)Delta is a Euclidean descent direction (factor 2 absorbed
-    into the step size).  Backtracking is performed on the SAME fixed samples
-    and normalized weights.
+    Hence d_q(z)=g(z)Delta_q is a Euclidean descent direction (factor 2
+    absorbed into the step size).
+
+    IMPORTANT: the batch is redrawn between outer iterations, but it is held
+    FIXED during backtracking within one iteration.  Thus every accepted trial
+    is compared against the same empirical objective F_q.
+
+    If eval_samples/eval_weights are supplied, they are used only to report a
+    stable reference objective along the trajectory; they never affect the
+    update direction or line search.
     """
     z = np.asarray(z_init, dtype=float).copy()
+    localization_center = np.asarray(localization_center, dtype=float)
+
     trajectory = [z.copy()]
-    energy_history = []
+    batch_energy_before = []
+    batch_energy_after = []
+    eval_energy_history = []
     shooting_error_history = []
 
+    if eval_samples is not None and eval_weights is not None:
+        eval_E0, _, _ = frechet_energy(
+            z,
+            eval_samples,
+            eval_weights,
+            metric_lambda,
+            shooting_schedule=shooting_schedule,
+            shooting_iters=shooting_iters,
+            shooting_lr=shooting_lr,
+        )
+        eval_energy_history.append(eval_E0)
+
     for q in range(Q):
+        # ----------------------------------------------------
+        # NEW Monte Carlo neighborhood every optimization step.
+        # ----------------------------------------------------
+        samples = sample_local_proposal(
+            rng,
+            center=localization_center,
+            epsilon=epsilon,
+            N=N,
+        )
+        weights = normalized_importance_weights(samples)
+
         energy, logs, errors = frechet_energy(
             z,
             samples,
@@ -332,22 +380,26 @@ def expected_primitive(
         direction = metric_apply(z, delta, metric_lambda=metric_lambda)
         direction_norm = float(np.linalg.norm(direction))
 
-        energy_history.append(energy)
+        batch_energy_before.append(energy)
         shooting_error_history.append(errors.copy())
 
+        ess = 1.0 / np.sum(weights**2)
         print(
             f"Iter {q + 1:02d}/{Q}: "
-            f"F={energy:.8f}, |d|={direction_norm:.6g}, "
+            f"batch F={energy:.8f}, |d|={direction_norm:.6g}, "
+            f"ESS={ess:.2f}/{N}, "
             f"log err mean={errors.mean():.3e}, max={errors.max():.3e}"
         )
 
         if direction_norm <= grad_tol:
             print("  descent direction below tolerance; stopping")
+            batch_energy_after.append(energy)
             break
 
         accepted = False
         alpha = float(step_size)
 
+        # Backtracking uses the SAME freshly drawn batch and weights.
         for _ in range(max_backtracking_steps):
             z_trial = z + alpha * direction
             trial_energy, _, _ = frechet_energy(
@@ -363,9 +415,10 @@ def expected_primitive(
             if np.isfinite(trial_energy) and trial_energy <= energy:
                 z = z_trial
                 trajectory.append(z.copy())
+                batch_energy_after.append(trial_energy)
                 print(
                     f"  accepted step={alpha:.6g}: "
-                    f"F {energy:.8f} -> {trial_energy:.8f}"
+                    f"same-batch F {energy:.8f} -> {trial_energy:.8f}"
                 )
                 accepted = True
                 break
@@ -373,12 +426,31 @@ def expected_primitive(
             alpha *= backtracking_factor
 
         if not accepted:
-            print("  no decreasing trial step found; stopping")
-            break
+            batch_energy_after.append(energy)
+            print("  no decreasing trial step found for this batch; point unchanged")
+            # Because a new batch is drawn next iteration, a failed step on one
+            # Monte Carlo realization is not a reason to terminate the stochastic
+            # optimization entirely.
+            trajectory.append(z.copy())
+
+        if eval_samples is not None and eval_weights is not None:
+            eval_E, _, _ = frechet_energy(
+                z,
+                eval_samples,
+                eval_weights,
+                metric_lambda,
+                shooting_schedule=shooting_schedule,
+                shooting_iters=shooting_iters,
+                shooting_lr=shooting_lr,
+            )
+            eval_energy_history.append(eval_E)
+            print(f"  fixed evaluation F={eval_E:.8f}")
 
     return (
         np.asarray(trajectory),
-        np.asarray(energy_history),
+        np.asarray(batch_energy_before),
+        np.asarray(batch_energy_after),
+        np.asarray(eval_energy_history),
         shooting_error_history,
     )
 
@@ -399,14 +471,19 @@ if __name__ == "__main__":
     # Current-paper metric parameter lambda.
     metric_lambda = 0.50
 
-    # Draw proposal samples and construct fixed normalized importance weights.
-    samples = sample_local_proposal(
-        rng,
+    # Optimization batches are redrawn inside expected_primitive at EVERY step.
+    # A separate, larger fixed Monte Carlo set is used ONLY for diagnostics so
+    # we can see a stable reference objective while the optimization remains
+    # fully stochastic.
+    eval_rng = np.random.default_rng(12345)
+    N_eval = 128
+    eval_samples = sample_local_proposal(
+        eval_rng,
         center=localization_center,
         epsilon=epsilon,
-        N=N,
+        N=N_eval,
     )
-    weights = normalized_importance_weights(samples)
+    eval_weights = normalized_importance_weights(eval_samples)
 
     # Optimization initialization, kept separate from the localization center.
     # We choose a point far enough away to make the descent trajectory visible,
@@ -419,12 +496,20 @@ if __name__ == "__main__":
     print(f"  N                   = {N}")
     print(f"  lambda              = {metric_lambda}")
     print(f"  initial point       = {z_init}")
-    print(f"  importance ESS      = {1.0 / np.sum(weights**2):.3f} / {N}")
+    print(f"  proposal points per step = {N} (REDRAWN every iteration)")
 
-    traj, energy_history, shooting_errors = expected_primitive(
-        samples,
-        weights,
-        z_init,
+    (
+        traj,
+        batch_energy_before,
+        batch_energy_after,
+        eval_energy_history,
+        shooting_errors,
+    ) = expected_primitive(
+        rng,
+        localization_center=localization_center,
+        epsilon=epsilon,
+        N=N,
+        z_init=z_init,
         metric_lambda=metric_lambda,
         step_size=0.20,
         Q=18,
@@ -434,6 +519,8 @@ if __name__ == "__main__":
         shooting_iters=50,
         shooting_lr=0.5,
         grad_tol=1e-7,
+        eval_samples=eval_samples,
+        eval_weights=eval_weights,
     )
 
     # Exact Euclidean mean of the localized target measure.  This is NOT the
@@ -443,8 +530,8 @@ if __name__ == "__main__":
 
     final_energy, _, final_errors = frechet_energy(
         traj[-1],
-        samples,
-        weights,
+        eval_samples,
+        eval_weights,
         metric_lambda,
         shooting_schedule=(2, 4, 8, 16, 32),
         shooting_iters=50,
@@ -474,16 +561,6 @@ if __name__ == "__main__":
     plt.figure(figsize=(8, 6))
     plt.contourf(X, Y, Z, levels=40, cmap="viridis")
 
-    # Proposal samples; marker sizes visualize their normalized importance weights.
-    sizes = 30.0 + 260.0 * weights / weights.max()
-    plt.scatter(
-        samples[:, 0],
-        samples[:, 1],
-        s=sizes,
-        alpha=0.55,
-        label="Local proposal samples",
-    )
-
     plt.plot(
         traj[:, 0],
         traj[:, 1],
@@ -499,27 +576,6 @@ if __name__ == "__main__":
         marker="s",
         label="Optimization start",
     )
-    plt.scatter(
-        traj[-1, 0],
-        traj[-1, 1],
-        s=100,
-        marker="*",
-        label="Estimated Frechet mean",
-    )
-    plt.scatter(
-        localization_center[0],
-        localization_center[1],
-        s=100,
-        marker="x",
-        label="Localization center",
-    )
-    plt.scatter(
-        exact_localized_euclidean_mean[0],
-        exact_localized_euclidean_mean[1],
-        s=90,
-        marker="D",
-        label="Exact localized Euclidean mean",
-    )
 
     plt.legend()
     plt.title("Localized Frechet Mean for a 2D Standard Gaussian")
@@ -527,5 +583,5 @@ if __name__ == "__main__":
     plt.ylabel("y")
     plt.colorbar(label="Gaussian density")
     plt.tight_layout()
-    plt.savefig("gaussian_expected_primitive_updated.png", dpi=180, bbox_inches="tight")
+    plt.savefig("gaussian_expected_primitive_redraw.png", dpi=180, bbox_inches="tight")
     plt.show()
