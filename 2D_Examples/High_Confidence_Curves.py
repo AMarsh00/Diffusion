@@ -2,25 +2,6 @@
 Computes our High-Confidence Curve interpolation for a ridge (smeared Gaussian) dataset.
 """
 
-"""
-High-Confidence Curve interpolation for a 2D ridge (anisotropic Gaussian)
-dataset, using the same geometric construction as the current paper.
-
-Why this synthetic setup is chosen carefully:
-- The data distribution is an oriented anisotropic Gaussian, so its score and
-  score Jacobian are known exactly.
-- The generator Phi is known exactly and maps z~N(0,I_2) to the ridge density.
-- The endpoints are genuine generator outputs. They are chosen on the same
-  side of the ridge so that the normal-projected HCC direction is nontrivial.
-  (For endpoints symmetric through the origin, the local centrality direction
-  is largely tangential and is intentionally removed by the HCC projection.)
-- The initial ambient geodesic and every local Log map use the same
-  coarse-to-fine residual shooting scheme.
-- No arc-length respacing/reparameterization is performed.
-- The known squared distance to the ridge centerline is used ONLY as an
-  independent synthetic validation metric, never as the optimization objective.
-"""
-
 import numpy as np
 import matplotlib.pyplot as plt
 
