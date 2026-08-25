@@ -1,21 +1,21 @@
 """
-Loads two training images, computes the geodesic interpolation between them, then refines it into the High-Confidence Curve interpolation.
+Loads two training images, computes the linear interpolation between them (figures in paper use geodesic, the code here is linear for speed), then refines it into the High-Confidence Curve interpolation.
 """
 
 import os
 import math
+from typing import Callable, Optional, Tuple
+
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from PIL import Image, ImageDraw, ImageFont
-import torch.nn.functional as F
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 import matplotlib.pyplot as plt
 
-# ------------------------
-# UNetSD Components
-# ------------------------
+
+# -----------------------------------------------------------------------------
+# UNet -- unchanged for checkpoint compatibility
+# -----------------------------------------------------------------------------
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -27,34 +27,30 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = math.log(10000) / (half_dim - 1)
         embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
         embeddings = timestep[:, None] * embeddings[None, :]
-        embeddings = torch.cat([embeddings.sin(), embeddings.cos()], dim=-1)
-        return embeddings
+        return torch.cat([embeddings.sin(), embeddings.cos()], dim=-1)
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_emb_dim, use_skip_conv=False):
         super().__init__()
-        self.use_skip_conv = use_skip_conv
         self.norm1 = nn.GroupNorm(8, in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.time_mlp = nn.Linear(time_emb_dim, out_channels)
-        if in_channels != out_channels or use_skip_conv:
-            self.skip_conv = nn.Conv2d(in_channels, out_channels, 1)
-        else:
-            self.skip_conv = nn.Identity()
+        self.skip_conv = (
+            nn.Conv2d(in_channels, out_channels, 1)
+            if in_channels != out_channels or use_skip_conv
+            else nn.Identity()
+        )
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x, t):
-        h = self.norm1(x)
-        h = self.relu(h)
-        h = self.conv1(h)
-        time_emb = self.time_mlp(t).unsqueeze(-1).unsqueeze(-1)
-        h = h + time_emb
-        h = self.norm2(h)
-        h = self.relu(h)
-        h = self.conv2(h)
+        h = self.conv1(self.relu(self.norm1(x)))
+        h = h + self.time_mlp(t).unsqueeze(-1).unsqueeze(-1)
+        h = self.conv2(self.relu(self.norm2(h)))
         return h + self.skip_conv(x)
+
 
 class Downsample(nn.Module):
     def __init__(self, channels):
@@ -64,6 +60,7 @@ class Downsample(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+
 class Upsample(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -72,6 +69,7 @@ class Upsample(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+
 class UNetSD(nn.Module):
     def __init__(self, in_channels=3, base_channels=64, time_emb_dim=256):
         super().__init__()
@@ -79,13 +77,13 @@ class UNetSD(nn.Module):
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 4),
             nn.ReLU(),
-            nn.Linear(time_emb_dim * 4, time_emb_dim)
+            nn.Linear(time_emb_dim * 4, time_emb_dim),
         )
         self.init_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
         self.downs = nn.ModuleList([
             ResidualBlock(base_channels, base_channels, time_emb_dim),
-            ResidualBlock(base_channels, base_channels * 2, time_emb_dim, use_skip_conv=True),
-            ResidualBlock(base_channels * 2, base_channels * 4, time_emb_dim, use_skip_conv=True),
+            ResidualBlock(base_channels, base_channels * 2, time_emb_dim, True),
+            ResidualBlock(base_channels * 2, base_channels * 4, time_emb_dim, True),
         ])
         self.downsamples = nn.ModuleList([
             Downsample(base_channels),
@@ -100,9 +98,9 @@ class UNetSD(nn.Module):
             Upsample(base_channels),
         ])
         self.ups = nn.ModuleList([
-            ResidualBlock(base_channels * 8, base_channels * 2, time_emb_dim, use_skip_conv=True),
-            ResidualBlock(base_channels * 4, base_channels, time_emb_dim, use_skip_conv=True),
-            ResidualBlock(base_channels * 2, base_channels, time_emb_dim, use_skip_conv=True),
+            ResidualBlock(base_channels * 8, base_channels * 2, time_emb_dim, True),
+            ResidualBlock(base_channels * 4, base_channels, time_emb_dim, True),
+            ResidualBlock(base_channels * 2, base_channels, time_emb_dim, True),
         ])
         self.out_norm = nn.GroupNorm(8, base_channels)
         self.out_relu = nn.ReLU()
@@ -120,449 +118,943 @@ class UNetSD(nn.Module):
         x = self.mid2(x, t_emb)
         for upsample, block in zip(self.upsamples, self.ups):
             x = upsample(x)
-            res = residuals.pop()
-            x = torch.cat([x, res], dim=1)
+            x = torch.cat([x, residuals.pop()], dim=1)
             x = block(x, t_emb)
-        x = self.out_norm(x)
-        x = self.out_relu(x)
-        x = self.out_conv(x)
-        return x
+        return self.out_conv(self.out_relu(self.out_norm(x)))
 
-# ------------------------
-# VP Scheduler
-# ------------------------
+
+# -----------------------------------------------------------------------------
+# VP schedule and deterministic DDIM maps
+# -----------------------------------------------------------------------------
 class VPScheduler:
     def __init__(self, num_timesteps=1000, beta_start=1e-4, beta_end=0.02):
         self.num_timesteps = num_timesteps
         self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
-        self.alphas = 1 - self.betas
+        self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
-    def q_sample(self, x0, t, noise=None):
-        if noise is None:
-            noise = torch.randn_like(x0)
-        alphas_cumprod = self.alphas_cumprod.to(x0.device)
-        if isinstance(t, int):
-            t = torch.tensor([t], device=x0.device)
-        sqrt_alpha_cumprod = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1, 1)
-        sqrt_one_minus_alpha_cumprod = torch.sqrt(1 - alphas_cumprod[t]).view(-1, 1, 1, 1)
-        return sqrt_alpha_cumprod * x0 + sqrt_one_minus_alpha_cumprod * noise
 
-# ------------------------
-# DDIM deterministic sampling
-# ------------------------
-def ddim_sample(model, scheduler, x_T, timesteps, eta=0.0):
-    x_t = x_T
-    device = x_t.device
-    alphas_cumprod = scheduler.alphas_cumprod.to(device)
-    for i in range(len(timesteps) - 1):
-        t = timesteps[i]
-        t_prev = timesteps[i + 1]
-        alpha_t = alphas_cumprod[t]
-        alpha_t_prev = alphas_cumprod[t_prev]
-        sqrt_alpha_t = torch.sqrt(alpha_t)
-        sqrt_alpha_t_prev = torch.sqrt(alpha_t_prev)
-        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
-        t_tensor = torch.tensor([t], device=device)
-        epsilon_theta = model(x_t, t_tensor)
-        x0_pred = (x_t - sqrt_one_minus_alpha_t * epsilon_theta) / sqrt_alpha_t
-        sigma_t = eta * torch.sqrt(
-            (1 - alpha_t_prev) / (1 - alpha_t) * (1 - alpha_t / alpha_t_prev)
-        )
-        sigma_t_val = sigma_t.item()
-        noise = torch.randn_like(x_t) if sigma_t_val > 0 else torch.zeros_like(x_t)
-        x_t = sqrt_alpha_t_prev * x0_pred + torch.sqrt(1 - alpha_t_prev - sigma_t_val**2) * epsilon_theta + sigma_t * noise
-    return x_t
+def _time_grid(start_t: int, end_t: int, num_steps: Optional[int] = None):
+    if start_t == end_t:
+        return [int(start_t)]
+    max_steps = abs(start_t - end_t) + 1
+    if num_steps is None:
+        num_steps = max_steps
+    num_steps = max(2, min(int(num_steps), max_steps))
+    vals = torch.linspace(start_t, end_t, num_steps).round().long().tolist()
+    out = [int(vals[0])]
+    for v in vals[1:]:
+        v = int(v)
+        if v != out[-1]:
+            out.append(v)
+    if out[-1] != int(end_t):
+        out.append(int(end_t))
+    return out
 
-# ------------------------
-# Score function
-# ------------------------
-def score_fn(x, model, scheduler, t):
-    device = x.device
-    alphas_cumprod = scheduler.alphas_cumprod.to(device)
 
-    if isinstance(t, int):
-        t_tensor = torch.tensor([t], device=device)
-        alpha_bar = alphas_cumprod[t]
-    else:
-        t_tensor = t
-        alpha_bar = alphas_cumprod[t]
+@torch.no_grad()
+def ddim_reverse_segment(model, scheduler, x_start, start_t, end_t, num_steps=None):
+    """Numerical deterministic DDIM map from a noisier state to a cleaner state."""
+    if start_t < end_t:
+        raise ValueError("ddim_reverse_segment requires start_t >= end_t")
+    if start_t == end_t:
+        return x_start.clone()
 
-    epsilon_theta = model(x, t_tensor)
-    score = - epsilon_theta / torch.sqrt(1 - alpha_bar)
-    return score
+    x = x_start.clone()
+    alpha_cum = scheduler.alphas_cumprod.to(x.device)
+    grid = _time_grid(start_t, end_t, num_steps)
+    for t, t_prev in zip(grid[:-1], grid[1:]):
+        alpha_t = alpha_cum[t]
+        alpha_prev = alpha_cum[t_prev]
+        tt = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
+        eps = model(x, tt)
+        x0_pred = (x - torch.sqrt(1 - alpha_t) * eps) / torch.sqrt(alpha_t)
+        x = torch.sqrt(alpha_prev) * x0_pred + torch.sqrt(1 - alpha_prev) * eps
+    return x
 
-# ------------------------
-# Levi-Civita Exp Map
-# ------------------------
-def levi_civita_exp_map(x, v, model, scheduler, t_idx, lambda=1.0, x_ind=None, n_steps=10, n_steps_int=10):
+
+@torch.no_grad()
+def ddim_forward_inversion_segment(model, scheduler, x_start, start_t, end_t, num_steps=None):
+    """Numerical deterministic DDIM inversion from a cleaner state to a noisier state."""
+    if start_t > end_t:
+        raise ValueError("ddim_forward_inversion_segment requires start_t <= end_t")
+    if start_t == end_t:
+        return x_start.clone()
+
+    x = x_start.clone()
+    alpha_cum = scheduler.alphas_cumprod.to(x.device)
+    grid = _time_grid(start_t, end_t, num_steps)
+    for t, t_next in zip(grid[:-1], grid[1:]):
+        alpha_t = alpha_cum[t]
+        alpha_next = alpha_cum[t_next]
+        tt = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
+        eps = model(x, tt)
+        x0_pred = (x - torch.sqrt(1 - alpha_t) * eps) / torch.sqrt(alpha_t)
+        x = torch.sqrt(alpha_next) * x0_pred + torch.sqrt(1 - alpha_next) * eps
+    return x
+
+
+def ddim_reverse_segment_differentiable(
+    model,
+    scheduler,
+    x_start,
+    start_t,
+    end_t,
+    num_steps=None,
+    use_checkpoint=True,
+):
+    """Differentiable numerical DDIM map, used for D Phi(z)^T covector VJPs."""
+    if start_t < end_t:
+        raise ValueError("start_t must be >= end_t")
+    if start_t == end_t:
+        return x_start
+
+    from torch.utils.checkpoint import checkpoint
+
+    x = x_start
+    alpha_cum = scheduler.alphas_cumprod.to(x.device)
+    grid = _time_grid(start_t, end_t, num_steps)
+
+    for t, t_prev in zip(grid[:-1], grid[1:]):
+        alpha_t = alpha_cum[t]
+        alpha_prev = alpha_cum[t_prev]
+
+        def step(inp, t=t, alpha_t=alpha_t, alpha_prev=alpha_prev):
+            tt = torch.full((inp.shape[0],), int(t), device=inp.device, dtype=torch.long)
+            eps = model(inp, tt)
+            x0_pred = (inp - torch.sqrt(1 - alpha_t) * eps) / torch.sqrt(alpha_t)
+            return torch.sqrt(alpha_prev) * x0_pred + torch.sqrt(1 - alpha_prev) * eps
+
+        if use_checkpoint and x.requires_grad:
+            x = checkpoint(step, x, use_reentrant=False)
+        else:
+            x = step(x)
+    return x
+
+
+# -----------------------------------------------------------------------------
+# FIXED CLEAN-SPACE SCORE PROXY
+# -----------------------------------------------------------------------------
+def score_proxy(x_clean, model, scheduler, proxy_t: int):
+    r"""
+    Numerically stable proxy field used by the paper.
+
+    IMPORTANT: x_clean remains an x_0-space coordinate.  proxy_t is only the
+    network timestep used to evaluate the surrogate field; x_clean is NOT first
+    noised to x_proxy_t.
     """
-    Levi-Civita exponential map using path-integral metric with Sherman-Morrison
-    """
-    x_curr = x.clone().detach()
-    v_step = v / n_steps
+    device = x_clean.device
+    alpha_bar = scheduler.alphas_cumprod.to(device)[proxy_t]
+    tt = torch.full((x_clean.shape[0],), int(proxy_t), device=device, dtype=torch.long)
+    epsilon_theta = model(x_clean, tt)
+    return -epsilon_theta / torch.sqrt(1.0 - alpha_bar)
 
+
+def _batch_dot(a, b):
+    shape = [a.shape[0]] + [1] * (a.ndim - 1)
+    return (a * b).flatten(1).sum(dim=1).view(*shape)
+
+
+def metric_inner_from_score(s, u, v, metric_lambda):
+    return _batch_dot(u, v) + metric_lambda * _batch_dot(s, u) * _batch_dot(s, v)
+
+
+def metric_apply_from_score(s, v, metric_lambda):
+    """Apply g(x)=I+lambda ss^T to a tangent vector."""
+    return v + metric_lambda * s * _batch_dot(s, v)
+
+
+def score_proxy_and_jvp(x, v, model, scheduler, proxy_t):
+    """Return s_tilde(x) and D s_tilde(x)[v] without forming the full Jacobian."""
+    x0 = x.detach()
+    v0 = v.detach()
+
+    def f(inp):
+        return score_proxy(inp, model, scheduler, proxy_t)
+
+    try:
+        from torch.func import jvp as func_jvp
+        s, jv = func_jvp(f, (x0,), (v0,))
+    except Exception:
+        with torch.enable_grad():
+            s, jv = torch.autograd.functional.jvp(
+                f, x0, v0, create_graph=False, strict=False
+            )
+    return s.detach(), jv.detach()
+
+
+def geodesic_acceleration_proxy(x, v, model, scheduler, proxy_t, metric_lambda):
+    r"""
+    Paper's Levi-Civita acceleration for the fixed proxy field:
+
+      a = -lambda/(1+lambda||s_tilde||^2) s_tilde (v^T D s_tilde v).
+
+    Exact when D s_tilde is symmetric; used as the paper's ideal-score / approximately
+    conservative learned-score approximation.
+    """
+    s, jv = score_proxy_and_jvp(x, v, model, scheduler, proxy_t)
+    v_j_v = _batch_dot(v, jv)
+    denom = 1.0 + metric_lambda * _batch_dot(s, s)
+    return -(metric_lambda / denom) * s * v_j_v
+
+
+def geodesic_exp_map_proxy(
+    x,
+    v,
+    model,
+    scheduler,
+    proxy_t,
+    metric_lambda=1.0,
+    n_steps=6,
+):
+    """Numerically integrate the proxy-metric Levi-Civita ODE over unit time."""
+    x_curr = x.detach().clone()
+    v_curr = v.detach().clone()
+    dt = 1.0 / float(n_steps)
     for _ in range(n_steps):
-        # Compute metric (rank-1)
-        if x_ind is None:
-            x_ind = torch.zeros_like(x_curr)
-
-        s_x = score_fn(x_curr, model, scheduler, t_idx).view(-1)
-        w = lambda
-
-        # Solve G dx = v_step via Sherman-Morrison
-        s_dot_s = (s_x**2).sum()
-        s_dot_v = (s_x * v_step.view(-1)).sum()
-        dx = v_step.view(-1) - w * s_x * s_dot_v / (1 + w * s_dot_s)
-        dx = dx.view_as(x_curr)
-
-        x_curr = x_curr + dx
-
+        a = geodesic_acceleration_proxy(
+            x_curr, v_curr, model, scheduler, proxy_t, metric_lambda
+        )
+        v_curr = v_curr + dt * a
+        x_curr = x_curr + dt * v_curr
     return x_curr.detach()
 
-# ------------------------
-# Log map shooting
-# ------------------------
+
 @torch.no_grad()
-def log_map_shooting(y, y_target, model, scheduler, t_idx,
-                     lambda=1e6, max_iters=1000, lr=0.1,
-                     n_substeps_schedule=[1, 2, 4, 8],):
-    y = y.detach()
-    y_target = y_target.detach()
-    tol = 1e-2
-    momentum_gamma = 0.9
-
-    v = (y_target - y).detach().clone()
-    v.requires_grad_(True)
-    momentum = torch.zeros_like(v)
+def log_map_shooting(x, y_target, exp_map_fn: Callable, max_iters=8, lr=0.4, tol=1e-3):
+    """Damped endpoint shooting; no global convexity claim is made."""
+    base = x.detach()
+    target = y_target.detach()
+    v = (target - base).clone()
     best_v = v.clone()
-    best_loss = float('inf')
+    best_loss = torch.full((v.shape[0],), float("inf"), device=v.device, dtype=v.dtype)
 
-    for idx, n_substeps in enumerate(n_substeps_schedule):
-        n_iters = max_iters // len(n_substeps_schedule)
-        for i in range(n_iters):
-            y_pred = levi_civita_exp_map(y, v, model, scheduler, t_idx,
-                                         lambda=lambda, n_steps=n_substeps)
-            residual = y_target - y_pred
-            loss = residual.norm()**2
+    for _ in range(max_iters):
+        y_pred = exp_map_fn(base, v)
+        residual = target - y_pred
+        loss = residual.flatten(1).pow(2).sum(dim=1)
+        improved = loss < best_loss
+        if improved.any():
+            shape = [v.shape[0]] + [1] * (v.ndim - 1)
+            best_v = torch.where(improved.view(*shape), v, best_v)
+            best_loss = torch.minimum(best_loss, loss)
+        if torch.sqrt(loss.mean()).item() < tol:
+            break
+        v = v + lr * residual
+    return best_v.detach()
 
-            if loss.item() < tol:
+
+def log_map_shooting_chunked(x, y, exp_map_fn, max_iters=1, lr=0.5, tol=1e-3, chunk_size=16):
+    if chunk_size is None or x.shape[0] <= chunk_size:
+        return log_map_shooting(x, y, exp_map_fn, max_iters, lr, tol)
+    out = []
+    for start in range(0, x.shape[0], chunk_size):
+        stop = min(start + chunk_size, x.shape[0])
+        out.append(log_map_shooting(
+            x[start:stop], y[start:stop], exp_map_fn,
+            max_iters=max_iters, lr=lr, tol=tol,
+        ))
+    return torch.cat(out, dim=0)
+
+
+# -----------------------------------------------------------------------------
+# Localized latent measure + mathematically correct constrained Frechet direction
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def sample_local_proposal_with_importance_weights(
+    z_centers,
+    n_samples: int,
+    sigma: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    Local proposal:
+        q_{z0,sigma}(z) = N(z0, sigma^2 I).
+
+    We define the localized target measure
+        nu_{z0,sigma}(dz) ∝ K_sigma(z,z0) mu(dz),
+    where mu=N(0,I) and
+        K_sigma(z,z0) = exp(-||z-z0||^2/(2 sigma^2)).
+
+    Since q is proportional to K_sigma as a density in z, self-normalized
+    importance sampling from q has weights
+        w_i ∝ mu(z_i) ∝ exp(-||z_i||^2/2).
+
+    This preserves the finite-sample behavior of the original code while giving
+    the weighting a correct importance-sampling interpretation.  The weights do
+    NOT depend on the candidate Frechet mean/current optimization variable.
+    """
+    if sigma <= 0:
+        raise ValueError("sigma must be positive")
+
+    m = z_centers.shape[0]
+    shape = z_centers.shape[1:]
+
+    if n_samples % 2 != 0:
+        raise ValueError("n_samples must be even for antithetic sampling")
+
+    half = n_samples // 2
+    noise_half = torch.randn(
+        m, half, *shape,
+        device=z_centers.device,
+        dtype=z_centers.dtype,
+    )
+    noise = torch.cat([noise_half, -noise_half], dim=1)
+    Z = z_centers[:, None] + float(sigma) * noise
+
+    # log mu(z_i), constants omitted.
+    log_w = -0.5 * Z.flatten(2).pow(2).sum(dim=2)
+    weights = torch.softmax(log_w, dim=1)
+    return Z, weights
+
+
+@torch.no_grad()
+def evaluate_fixed_local_frechet_energy(
+    centers_x0,
+    candidate_Y,
+    weights,
+    exp_map_fn: Callable,
+    model,
+    scheduler,
+    proxy_t,
+    metric_lambda,
+    local_shooting_iters=3,
+    local_shooting_lr=0.5,
+    pair_chunk_size=16,
+):
+    r"""
+    Evaluate the SAME fixed empirical local Frechet objective used by a line-search
+    step:
+
+        F_i(x) = sum_j w_ij d_g(x, Y_ij)^2.
+
+    candidate_Y and weights are held fixed during backtracking.  This is important:
+    resampling while testing a step would compare different Monte Carlo objectives.
+
+    Distances are approximated with the same numerical shooting/log routine used to
+    construct the descent direction, so the implementation is internally consistent.
+    """
+    m, n_candidates = weights.shape
+    bases = centers_x0[:, None].expand(-1, n_candidates, *centers_x0.shape[1:])
+    flat_bases = bases.flatten(0, 1)
+    flat_Y = candidate_Y.flatten(0, 1)
+
+    logs = log_map_shooting_chunked(
+        flat_bases,
+        flat_Y,
+        exp_map_fn=exp_map_fn,
+        max_iters=local_shooting_iters,
+        lr=local_shooting_lr,
+        tol=1e-3,
+        chunk_size=pair_chunk_size,
+    ).view(m, n_candidates, *centers_x0.shape[1:])
+
+    s = score_proxy(centers_x0, model, scheduler, proxy_t).detach()
+    s_rep = s[:, None].expand_as(logs)
+    euclid_d2 = logs.flatten(2).pow(2).sum(dim=2)
+    score_d2 = metric_lambda * (s_rep * logs).flatten(2).sum(dim=2).pow(2)
+    energy = (weights * (euclid_d2 + score_d2)).sum(dim=1)
+    return energy.detach()
+
+
+@torch.no_grad()
+def local_frechet_direction_clean(
+    centers_x0,
+    z_centers_T,
+    latent_to_clean_fn: Callable,
+    exp_map_fn: Callable,
+    model,
+    scheduler,
+    proxy_t,
+    metric_lambda,
+    sigma=0.2,
+    n_candidates=8,
+    local_shooting_iters=3,
+    local_shooting_lr=0.5,
+    pair_chunk_size=16,
+):
+    r"""
+    Compute one empirical local Frechet descent direction in clean coordinates.
+
+    For each current latent center z_i, draw antithetic proposal samples
+
+        Z_ij ~ q_i = N(z_i, sigma^2 I)
+
+    (marginally; antithetic pairs are dependent but each has the correct q_i
+    marginal).  Define the localized target measure
+
+        nu_i(dz) proportional to K_sigma(z,z_i) mu(dz),
+
+    where mu=N(0,I) and K_sigma is the Gaussian localization kernel.  Since q_i
+    is proportional to K_sigma as a density in z, self-normalized importance
+    weights satisfy
+
+        w_ij proportional to mu(Z_ij) = exp(-||Z_ij||^2/2).
+
+    With Y_ij = Phi(Z_ij), define
+
+        F_i(x) = sum_j w_ij d_g(x,Y_ij)^2.
+
+    In a normal neighborhood, the Riemannian gradient is
+
+        grad_g F_i(x) = -2 sum_j w_ij Log_x(Y_ij).
+
+    Therefore delta_x below is the positive Riemannian descent direction (with
+    the factor 2 absorbed into the step length).
+    """
+    m = centers_x0.shape[0]
+    Z, weights = sample_local_proposal_with_importance_weights(
+        z_centers_T, n_candidates, sigma
+    )
+    flat_Z = Z.flatten(0, 1)
+    flat_Y = latent_to_clean_fn(flat_Z)
+    candidate_Y = flat_Y.view(m, n_candidates, *centers_x0.shape[1:])
+
+    bases = centers_x0[:, None].expand(-1, n_candidates, *centers_x0.shape[1:])
+    flat_bases = bases.flatten(0, 1)
+
+    logs = log_map_shooting_chunked(
+        flat_bases,
+        flat_Y,
+        exp_map_fn=exp_map_fn,
+        max_iters=local_shooting_iters,
+        lr=local_shooting_lr,
+        tol=1e-3,
+        chunk_size=pair_chunk_size,
+    ).view(m, n_candidates, *centers_x0.shape[1:])
+
+    wview = weights.view(m, n_candidates, *([1] * (centers_x0.ndim - 1)))
+    delta_x = (wview * logs).sum(dim=1)
+
+    s = score_proxy(centers_x0, model, scheduler, proxy_t).detach()
+    s_rep = s[:, None].expand_as(logs)
+    euclid_d2 = logs.flatten(2).pow(2).sum(dim=2)
+    score_d2 = metric_lambda * (s_rep * logs).flatten(2).sum(dim=2).pow(2)
+    local_energy = (weights * (euclid_d2 + score_d2)).sum(dim=1)
+
+    candidate_rms = (
+        (flat_Y - flat_bases).flatten(1).pow(2).mean(dim=1).sqrt()
+        .view(m, n_candidates).mean(dim=1)
+    )
+    ess = 1.0 / weights.pow(2).sum(dim=1).clamp_min(1e-12)
+
+    return (
+        delta_x.detach(),
+        local_energy.detach(),
+        candidate_rms.detach(),
+        ess.detach(),
+        s,
+        candidate_Y.detach(),
+        weights.detach(),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Geodesic + generator-constrained clean-space refinement
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def build_geodesic_curve(xA, xB, log_map_fn, exp_map_fn, n_steps=10):
+    """
+    Build the ambient proxy-metric geodesic used to initialize the method.
+
+    The shooting solve is numerical, so Exp_x(Log_x(y)) need not land exactly on y.
+    We therefore pin the two boundary values explicitly.  This does not alter the
+    interior shooting trajectory and guarantees that the interpolation has the
+    requested endpoints.
+    """
+    v = log_map_fn(xA, xB)
+    alphas = torch.linspace(0.0, 1.0, n_steps, device=xA.device, dtype=xA.dtype)
+    bases = xA.expand(n_steps, *xA.shape[1:])
+    velocities = alphas.view(n_steps, *([1] * (v.ndim - 1))) * v.expand_as(bases)
+    curve = exp_map_fn(bases, velocities)
+    curve[0:1] = xA
+    curve[-1:] = xB
+    return curve
+
+
+def refine_latent_constrained_clean_frechet(
+    curve_z_T,
+    latent_to_clean_fn: Callable,
+    latent_to_clean_grad_fn: Callable,
+    exp_map_fn: Callable,
+    model,
+    scheduler,
+    proxy_t,
+    metric_lambda,
+    sigma=0.2,
+    n_iters=10,
+    n_candidates=8,
+    latent_step_size=0.18,
+    step_decay=0.80,
+    min_latent_step=0.035,
+    local_shooting_iters=3,
+    local_shooting_lr=0.5,
+    pair_chunk_size=16,
+    normalize_step=True,
+    backtracking_factor=0.5,
+    max_backtracking_steps=4,
+    energy_decrease_tol=0.0,
+):
+    r"""
+    Generator-constrained projected local Frechet descent with per-node backtracking.
+
+    At outer iteration k, for each interior latent node z_i:
+
+      1. Decode x_i = Phi(z_i).
+      2. Draw ONE local Monte Carlo candidate set {Z_ij}, decode Y_ij=Phi(Z_ij),
+         and compute fixed normalized importance weights w_ij.
+      3. Form the approximate Riemannian Frechet descent direction
+
+             delta_i = sum_j w_ij Log_{x_i}(Y_ij).
+
+      4. For
+
+             F_i(z) = sum_j w_ij d_g(Phi(z),Y_ij)^2,
+
+         the Euclidean latent gradient is
+
+             grad_z F_i(z_i) = -2 D Phi(z_i)^T g(x_i) delta_i.
+
+         Hence d_i = D Phi(z_i)^T g(x_i) delta_i is a descent direction.
+
+      5. Project d_i orthogonally to the discrete latent-curve tangent.  Since
+         orthogonal projection is symmetric/idempotent, a nonzero projected
+         direction remains a descent direction for the objective restricted to
+         the normal subspace.
+
+      6. Normalize the projected direction and use its scheduled norm as a
+         trust-region-like trial step.
+
+      7. Backtrack PER NODE using the SAME {Y_ij,w_ij}.  A trial is accepted only
+         when the corresponding fixed empirical Frechet energy does not increase
+         (up to energy_decrease_tol).  Otherwise the step is multiplied by
+         backtracking_factor.  If no tested step is accepted, that node stays put.
+
+    The neighborhood is refreshed only at the next outer iteration.  No respacing
+    is performed.
+
+    Numerical note: Log and d_g are approximated by the same shooting routine in
+    both the descent direction and line-search energy, so the implemented
+    approximate objective is internally consistent.
+    """
+    if not (0.0 < backtracking_factor < 1.0):
+        raise ValueError("backtracking_factor must lie in (0,1)")
+    if max_backtracking_steps < 1:
+        raise ValueError("max_backtracking_steps must be >= 1")
+
+    curve_z = curve_z_T.detach().clone()
+    history_z = [curve_z.clone()]
+    energy_history = []
+    accepted_energy_history = []
+    step_history = []
+
+    for it in range(n_iters):
+        print(f"\nClean-space proxy Frechet refinement {it + 1}/{n_iters}")
+        z_centers = curve_z[1:-1].detach()
+        m = z_centers.shape[0]
+
+        # One differentiable decoder graph for all current interior nodes.
+        with torch.enable_grad():
+            z_req = z_centers.clone().requires_grad_(True)
+            x_graph = latent_to_clean_grad_fn(z_req)
+        centers_x0 = x_graph.detach()
+
+        (
+            delta_x,
+            local_energy,
+            candidate_rms,
+            ess,
+            s_centers,
+            candidate_Y,
+            weights,
+        ) = local_frechet_direction_clean(
+            centers_x0=centers_x0,
+            z_centers_T=z_centers,
+            latent_to_clean_fn=latent_to_clean_fn,
+            exp_map_fn=exp_map_fn,
+            model=model,
+            scheduler=scheduler,
+            proxy_t=proxy_t,
+            metric_lambda=metric_lambda,
+            sigma=sigma,
+            n_candidates=n_candidates,
+            local_shooting_iters=local_shooting_iters,
+            local_shooting_lr=local_shooting_lr,
+            pair_chunk_size=pair_chunk_size,
+        )
+
+        # Differential of F_i through Phi.  If grad_g F_i=-2 delta_x, then
+        # grad_z F_i=-2 D Phi^T g delta_x; +D Phi^T g delta_x is descent.
+        with torch.no_grad():
+            pullback_covector = metric_apply_from_score(
+                s_centers, delta_x, metric_lambda
+            ).detach()
+
+        with torch.enable_grad():
+            scalar = (x_graph * pullback_covector).sum()
+            latent_dir = torch.autograd.grad(
+                scalar, z_req, retain_graph=False, create_graph=False
+            )[0].detach()
+
+        # Project in latent space to reduce tangential drift/clumping.
+        with torch.no_grad():
+            tau_z = curve_z[2:] - curve_z[:-2]
+            tau_norm_sq = tau_z.flatten(1).pow(2).sum(dim=1).clamp_min(1e-12)
+            dir_dot_tau = (latent_dir * tau_z).flatten(1).sum(dim=1)
+            view_shape = [m] + [1] * (latent_dir.ndim - 1)
+            latent_dir = latent_dir - (
+                dir_dot_tau / tau_norm_sq
+            ).view(*view_shape) * tau_z
+
+        dir_norm = latent_dir.flatten(1).norm(dim=1)
+        valid_dir = dir_norm > 1e-12
+        safe_norm = dir_norm.clamp_min(1e-12)
+        view_shape = [m] + [1] * (latent_dir.ndim - 1)
+
+        scheduled_step = max(
+            float(min_latent_step),
+            float(latent_step_size) * (float(step_decay) ** it),
+        )
+
+        if normalize_step:
+            unit_dir = latent_dir / safe_norm.view(*view_shape)
+        else:
+            # In the unnormalized case, unit_dir is simply the raw descent
+            # direction and the scalar step multiplies it below.
+            unit_dir = latent_dir
+
+        # Per-node monotone backtracking on the FIXED empirical objective.
+        accepted_z = z_centers.clone()
+        accepted_energy = local_energy.clone()
+        accepted = ~valid_dir
+        accepted_steps = torch.zeros(m, device=z_centers.device, dtype=z_centers.dtype)
+        trial_steps = torch.full(
+            (m,), scheduled_step, device=z_centers.device, dtype=z_centers.dtype
+        )
+
+        for bt in range(max_backtracking_steps):
+            active_idx = torch.nonzero(~accepted, as_tuple=False).flatten()
+            if active_idx.numel() == 0:
                 break
 
-            step = lr * residual / (residual.norm() + 1e-8)
-            momentum = momentum_gamma * momentum + step
-            v = v + momentum
+            step_active = trial_steps[active_idx]
+            active_view = [active_idx.numel()] + [1] * (z_centers.ndim - 1)
+            trial_z = (
+                z_centers[active_idx]
+                + step_active.view(*active_view) * unit_dir[active_idx]
+            )
 
-            if n_substeps == n_substeps_schedule[-1] and loss.item() < best_loss:
-                best_loss = loss.item()
-                best_v = v.clone()
-    print(best_loss)
+            trial_x = latent_to_clean_fn(trial_z)
+            trial_energy = evaluate_fixed_local_frechet_energy(
+                centers_x0=trial_x,
+                candidate_Y=candidate_Y[active_idx],
+                weights=weights[active_idx],
+                exp_map_fn=exp_map_fn,
+                model=model,
+                scheduler=scheduler,
+                proxy_t=proxy_t,
+                metric_lambda=metric_lambda,
+                local_shooting_iters=local_shooting_iters,
+                local_shooting_lr=local_shooting_lr,
+                pair_chunk_size=pair_chunk_size,
+            )
 
-    return best_v
+            baseline = local_energy[active_idx]
+            # energy_decrease_tol is relative.  The default 0 requires monotone
+            # decrease; a tiny positive value can be used if numerical shooting
+            # noise makes strict monotonicity too brittle.
+            threshold = baseline * (1.0 + float(energy_decrease_tol))
+            accept_local = trial_energy <= threshold
 
-# ------------------------
-# Image helpers
-# ------------------------
+            if accept_local.any():
+                good_idx = active_idx[accept_local]
+                accepted_z[good_idx] = trial_z[accept_local]
+                accepted_energy[good_idx] = trial_energy[accept_local]
+                accepted_steps[good_idx] = step_active[accept_local]
+                accepted[good_idx] = True
+
+            reject_local = ~accept_local
+            if reject_local.any():
+                bad_idx = active_idx[reject_local]
+                trial_steps[bad_idx] *= float(backtracking_factor)
+
+        # Nodes that never passed the line search remain unchanged.
+        new_curve = curve_z.clone()
+        new_curve[1:-1] = accepted_z
+
+        n_accepted = int((accepted_steps > 0).sum().item())
+        n_rejected = int(m - n_accepted)
+        mean_accepted_step = (
+            accepted_steps[accepted_steps > 0].mean().item()
+            if n_accepted > 0 else 0.0
+        )
+        rel_change = (accepted_energy - local_energy) / local_energy.clamp_min(1e-12)
+
+        print(f"scheduled latent step: {scheduled_step:.6g}")
+        print(f"accepted nodes: {n_accepted}/{m}; unchanged nodes: {n_rejected}")
+        print(f"mean accepted latent step: {mean_accepted_step:.6g}")
+        print(f"mean fixed-objective energy before: {local_energy.mean().item():.6g}")
+        print(f"mean fixed-objective energy after:  {accepted_energy.mean().item():.6g}")
+        print(f"mean relative energy change: {rel_change.mean().item():.6g}")
+        print(f"mean candidate clean RMS distance: {candidate_rms.mean().item():.6g}")
+        print(f"mean importance ESS: {ess.mean().item():.4f} / {n_candidates}")
+
+        curve_z = new_curve.detach()
+        history_z.append(curve_z.clone())
+        energy_history.append(local_energy.cpu())
+        accepted_energy_history.append(accepted_energy.cpu())
+        step_history.append(accepted_steps.cpu())
+
+    return history_z, energy_history, accepted_energy_history, step_history
+
+
+@torch.no_grad()
+def build_linear_latent_curve(zA_T, zB_T, n_steps=10):
+    """Simple linear interpolation in latent z_T coordinates."""
+    alphas = torch.linspace(0.0, 1.0, n_steps, device=zA_T.device, dtype=zA_T.dtype)
+    curve = []
+    for a in alphas:
+        curve.append((1.0 - a) * zA_T + a * zB_T)
+    return torch.cat(curve, dim=0)
+
+
+# -----------------------------------------------------------------------------
+# Plotting
+# -----------------------------------------------------------------------------
 def load_image(path, image_size=64):
     transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
-        transforms.Normalize([0.5]*3, [0.5]*3)
+        transforms.Normalize([0.5] * 3, [0.5] * 3),
     ])
-    img = Image.open(path).convert("RGB")
-    return transform(img).unsqueeze(0)
+    return transform(Image.open(path).convert("RGB")).unsqueeze(0)
+
 
 @torch.no_grad()
-def Phi(y, model, scheduler, num_steps=100, eta=0.0):
-    timesteps = torch.linspace(scheduler.num_timesteps-1, 0, num_steps, dtype=torch.long)
-    x = ddim_sample(model, scheduler, y, timesteps, eta=eta)
-    return x
-
-# ------------------------
-# Geometry Computations
-# ------------------------
-@torch.no_grad()
-def expected_primitive(
-    z0,
-    Z,
-    Phi_fn,
-    log_map_fn,
-    exp_map_fn,
-    eps,
-    max_iter=200,
-    lr=0.01
-):
+def plot_initial_vs_refined(initial_z, refined_z, latent_to_clean_fn, filename):
     """
-    Compute the expected primitive of z0 w.r.t. a set of candidates Z
-    using a diffusion model Phi_fn and Riemannian log map.
+    Plot the initial latent linear interpolation versus the final refined curve.
+    Both rows are decoded through Phi, so the comparison is generator-constrained
+    and apples-to-apples.
     """
-    z_t = z0.clone()
+    pair = torch.cat([initial_z, refined_z], dim=0)
+    decoded = latent_to_clean_fn(pair)
+    L = initial_z.shape[0]
+    initial_x0 = decoded[:L]
+    refined_x0 = decoded[L:]
+    rows = [initial_x0, refined_x0]
 
-    # ---- Cache Phi(Z) once ----
-    Phi_Z = Phi_fn(Z)                       # [N,C,H,W]
-    Zi_norm2 = (Z**2).flatten(1).sum(dim=1) # [N]
+    fig, axes = plt.subplots(2, L, figsize=(1.8 * L, 3.7))
+    for i, row in enumerate(rows):
+        imgs = (row * 0.5 + 0.5).clamp(0, 1)
+        for j in range(L):
+            axes[i, j].imshow(transforms.ToPILImage()(imgs[j].cpu()))
+            axes[i, j].axis("off")
+    fig.suptitle("Linear latent interpolation (top) vs Local Frechet refinement (bottom)")
+    plt.tight_layout()
+    plt.savefig(filename, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
-    for _ in range(max_iter):
-        Phi_zt = Phi_fn(z_t)                # [1,C,H,W]
-        zt_norm2 = (z_t**2).sum()
-
-        # ---- Broadcast Phi_zt for batch log map ----
-        Phi_zt_rep = Phi_zt.repeat(Z.shape[0], 1, 1, 1)  # [N,C,H,W]
-
-        logs = log_map_fn(Phi_zt_rep, Phi_Z)            # [N,C,H,W]
-
-        # ---- Compute weights and gradient ----
-        log_w = 0.5 * (zt_norm2 - Zi_norm2)
-        log_w = log_w - log_w.max()          # stabilize
-        weights = torch.exp(log_w)
-        weights = weights / (weights.sum() + 1e-8)
-        weights = weights.view(-1,1,1,1)
-        grad = -2 * (weights * logs).sum(dim=0, keepdim=True)           # [1,C,H,W]
-
-        grad_norm = grad.norm() + 1e-8
-        grad = grad / grad_norm
-
-        # ---- Update z_t ----
-        z_t = z_t - lr * grad
-
-    return z_t
-
-def refine_high_confidence_curve(
-    curve,
-    Phi_fn,
-    log_map_fn,
-    exp_map_fn,
-    eps=0.5,
-    n_iters=5,
-    n_candidates=8,
-    conf_kwargs={}
-):
-
-    curves = [curve.clone()]
-
-    for it in range(n_iters):
-        print(f"\nRefinement iteration {it}")
-        new_curve = curve.clone()
-
-        for i in range(1, curve.shape[0] - 1):
-
-            z0 = curve[i:i+1]
-
-            # ---- sample neighborhood ----
-            candidates = z0 + eps * torch.randn(
-                n_candidates,
-                *z0.shape[1:],
-                device=z0.device
-            )
-
-            # ---- compute primitive minimizer ----
-            y_star = expected_primitive(
-                z0,
-                candidates,
-                Phi_fn,
-                log_map_fn,
-                exp_map_fn,
-                eps,
-                max_iter=conf_kwargs.get("max_iter", 200),
-                lr=conf_kwargs.get("lr", 0.01)
-            )
-
-            # ---- compute curve tangent ----
-            prev_pt = curve[i-1]
-            next_pt = curve[i+1]
-
-            tau = next_pt - prev_pt
-            tau = tau / (tau.norm() + 1e-8)
-
-            # ---- direction toward primitive ----
-            d = (y_star - z0).squeeze(0)
-
-            # ---- remove tangential component (not needed theoretically, but safety feature to prevent clumping even more) ----
-            d_dot_tau = (d * tau).sum()
-            d_perp = d - d_dot_tau * tau
-
-            # ---- update node ----
-            new_curve[i] = curve[i] + d_perp
-
-        print(torch.norm(new_curve - curve))
-
-        curve = new_curve
-        curves.append(curve.clone())
-
-    return curves
 
 @torch.no_grad()
-def plot_curve_images(curves, Phi_fn, title="High-Confidence Curve"):
-    n_curves = len(curves)
+def plot_refinement_history(history_z, latent_to_clean_fn, filename, every=1):
+    """Save selected refinement iterations so convergence/early stopping is visible."""
+    selected = list(range(0, len(history_z), max(1, int(every))))
+    if selected[-1] != len(history_z) - 1:
+        selected.append(len(history_z) - 1)
+
+    curves = [history_z[i] for i in selected]
     L = curves[0].shape[0]
+    decoded = latent_to_clean_fn(torch.cat(curves, dim=0))
+    rows = decoded.view(len(curves), L, *decoded.shape[1:])
 
-    fig, axes = plt.subplots(
-        n_curves, L, figsize=(1.8 * L, 1.8 * n_curves)
-    )
-
-    if n_curves == 1:
+    fig, axes = plt.subplots(len(curves), L, figsize=(1.8 * L, 1.7 * len(curves)))
+    if len(curves) == 1:
         axes = axes[None, :]
 
-    for i, curve in enumerate(curves):
-        imgs = Phi_fn(curve)
-        imgs = (imgs * 0.5 + 0.5).clamp(0, 1)
-
+    for r, (iter_idx, row) in enumerate(zip(selected, rows)):
+        imgs = (row * 0.5 + 0.5).clamp(0, 1)
         for j in range(L):
-            axes[i, j].imshow(
-                transforms.ToPILImage()(imgs[j].cpu())
-            )
-            axes[i, j].axis("off")
+            axes[r, j].imshow(transforms.ToPILImage()(imgs[j].cpu()))
+            axes[r, j].axis("off")
+        axes[r, 0].set_ylabel(f"iter {iter_idx}", rotation=0, labelpad=28, va="center")
 
-    plt.suptitle(title)
+    #fig.suptitle("Local Frechet refinement history")
     plt.tight_layout()
-    plt.savefig("HC_Curves.png")
-    
-@torch.no_grad()
-def ddim_invert(model, scheduler, x0, num_steps=1000):
-    """
-    Inverts a real image x0 into its latent noise representation x_T 
-    using the deterministic DDIM ODE.
-    """
-    device = x0.device
-    # For inversion, we step forward in time from 0 to T
-    timesteps = torch.linspace(0, scheduler.num_timesteps - 1, num_steps, dtype=torch.long)
-    
-    x_t = x0.clone()
-    alphas_cumprod = scheduler.alphas_cumprod.to(device)
-    
-    for i in range(len(timesteps) - 1):
-        t = timesteps[i]
-        t_next = timesteps[i + 1]
-        
-        alpha_t = alphas_cumprod[t]
-        alpha_t_next = alphas_cumprod[t_next]
-        
-        t_tensor = torch.tensor([t], device=device)
-        epsilon_theta = model(x_t, t_tensor)
-        
-        # Predict x0 from the current x_t
-        x0_pred = (x_t - torch.sqrt(1 - alpha_t) * epsilon_theta) / torch.sqrt(alpha_t)
-        
-        # Step forward to t_next (adding noise deterministically)
-        x_t = torch.sqrt(alpha_t_next) * x0_pred + torch.sqrt(1 - alpha_t_next) * epsilon_theta
-        
-    return x_t
-    
-@torch.no_grad()
-def build_geodesic_curve(xA_, xB_, log_map_fn, exp_map_fn, n_steps=10):
-    """
-    Construct a discrete geodesic:
-    x_{k+1} = exp_{x_k}( (1/N) * log_{x_k}(x_{k+1}) )
-    """
-    curve = [xA_]
+    plt.savefig(filename, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
-    # initial tangent guess
-    v = log_map_fn(xA_, xB_, max_iters=1000) / (n_steps - 1)
 
-    x = xA_.clone()
-
-    for _ in range(n_steps - 1):
-        # move along manifold
-        x = exp_map_fn(x, v)
-        curve.append(x)
-
-    return torch.cat(curve, dim=0)
-
-# ------------------------
-# Main
-# ------------------------
-@torch.no_grad()
+# -----------------------------------------------------------------------------
+# Main experiment
+# -----------------------------------------------------------------------------
 def main():
-    device = "cuda" # or "cpu"
-    image_path_A = "./andrewmvd/animal-faces/versions/1/afhq/train/dog/flickr_dog_000100.jpg"  # Update this path to the first training image you want to load
-    image_path_B = "./andrewmvd/animal-faces/versions/1/afhq/train/cat/flickr_cat_000100.jpg"  # Update this path to the second training image you want to load
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    image_path_A = "/data5/accounts/marsh/.cache/kagglehub/datasets/andrewmvd/animal-faces/versions/1/afhq/train/dog/flickr_dog_000070.jpg"
+    image_path_B = "/data5/accounts/marsh/.cache/kagglehub/datasets/andrewmvd/animal-faces/versions/1/afhq/train/cat/flickr_cat_000070.jpg"
+    checkpoint_path = "./vp_diffusion_outputs/unet_animal_epoch_2000.pt"
+
+    # ------------------------------------------------------------------
+    # Paper parameters
+    # ------------------------------------------------------------------
+    proxy_t = 400            # ONLY a score proxy; geometry remains in x_0 coordinates.
+    metric_lambda = 1e6
+
+    exp_ode_steps = 6
+    global_shooting_iters = 24
+    global_shooting_lr = 0.25
+    local_shooting_iters = 3
+    local_shooting_lr = 0.5
+    n_geo_points = 10
+
+    # Numerical DDIM Phi used for generator-constrained refinement.
+    # Increase to 64/100 for final figures if runtime allows.
+    # Restore the high-fidelity DDIM settings used by the original script.
+    # The previous fast version used 100 inversion steps and only 40 decode
+    # steps, which materially degraded interpolation image quality.
+    inversion_steps = 1000
+    refine_decode_steps = 100   # geometry/refinement; increase toward 1000 for fidelity
+    display_decode_steps = 1000 # final paper-quality rendering
+
+    sigma = 0.20
+    n_candidates = 16
+    refinement_iters = 50
+    latent_step_size = 0.18
+    step_decay = 0.80
+    min_latent_step = 0.035
+    pair_chunk_size = 16
+
+    # Per-node monotone backtracking prevents isolated overshoot artifacts.
+    backtracking_factor = 0.5
+    max_backtracking_steps = 4
+    energy_decrease_tol = 0.0
+
+    print(f"device={device}")
+    print(
+        f"proxy_t={proxy_t}, lambda={metric_lambda:g}, sigma={sigma:g}, "
+        f"candidates={n_candidates}, refinement_iters={refinement_iters}, "
+        f"latent_step0={latent_step_size:g}, decay={step_decay:g}, "
+        f"min_step={min_latent_step:g}"
+    )
 
     x0_A = load_image(image_path_A).to(device)
     x0_B = load_image(image_path_B).to(device)
+    x0_pair = torch.cat([x0_A, x0_B], dim=0)
 
     model = UNetSD().to(device)
     scheduler = VPScheduler(num_timesteps=1000)
-
-    checkpoint_path = "./vp_diffusion_outputs/unet_animal_epoch_2000.pt" # Update this path to the model you wish to load
-    if os.path.isfile(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        print("Loaded trained model.")
-    else:
-        print("Checkpoint not found. Using random weights.")
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(checkpoint_path)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
 
-    print("Inverting Image A (Dog)...")
-    xA_ = ddim_invert(model, scheduler, x0_A, num_steps=1000)
-    print("Inverting Image B (Cat)...")
-    xB_ = ddim_invert(model, scheduler, x0_B, num_steps=1000)
+    T = scheduler.num_timesteps - 1
 
-    xA = Phi(xA_, model, scheduler, num_steps=1000)
-    xB = Phi(xB_, model, scheduler, num_steps=1000)
-
-    t_idx = 400
-    lambda = 1000000.0
-    n_geo_steps = 10
-    lam = 1e6
-
-    xA2 = ddim_sample(model, scheduler, xA_, torch.linspace(999-t_idx, 0, 1000-t_idx, dtype=torch.long, device=device))
-    xB2 = ddim_sample(model, scheduler, xB_, torch.linspace(999-t_idx, 0, 1000-t_idx, dtype=torch.long, device=device))
+    print("Inverting endpoints to z_T...")
+    z_pair_T = ddim_forward_inversion_segment(
+        model, scheduler, x0_pair, 0, T, num_steps=inversion_steps
+    )
 
     @torch.no_grad()
-    def Phi_fn(z):
-        return Phi(z, model, scheduler, num_steps=1000)
-
-    def log_map_fn(x, y, max_iters=1000):
-        return log_map_shooting(
-            y=x,
-            y_target=y,
-            model=model,
-            scheduler=scheduler,
-            t_idx=t_idx,
-            lambda=lambda,
-            max_iters=max_iters
+    def latent_to_clean_fn(z_T):
+        """Decoder used inside refinement."""
+        return ddim_reverse_segment(
+            model, scheduler, z_T, T, 0, num_steps=refine_decode_steps
         )
 
+    @torch.no_grad()
+    def latent_to_clean_display_fn(z_T):
+        """High-fidelity decoder used only for final figures."""
+        return ddim_reverse_segment(
+            model, scheduler, z_T, T, 0, num_steps=display_decode_steps
+        )
+
+    def latent_to_clean_grad_fn(z_T):
+        return ddim_reverse_segment_differentiable(
+            model, scheduler, z_T, T, 0,
+            num_steps=refine_decode_steps, use_checkpoint=True,
+        )
+
+    @torch.no_grad()
+    def clean_to_latent_fn(x0):
+        return ddim_forward_inversion_segment(
+            model, scheduler, x0, 0, T, num_steps=inversion_steps
+        )
+
+    # Use reconstructed generated endpoints so the top and bottom curves share
+    # endpoints belonging to the same numerical DDIM map Phi.
+    x_pair_gen = latent_to_clean_display_fn(z_pair_T)
+    xA_gen, xB_gen = x_pair_gen[0:1], x_pair_gen[1:2]
+
     def exp_map_fn(x, v):
-        return levi_civita_exp_map(
+        return geodesic_exp_map_proxy(
             x, v,
             model=model,
             scheduler=scheduler,
-            t_idx=t_idx,
-            lambda=lambda
+            proxy_t=proxy_t,
+            metric_lambda=metric_lambda,
+            n_steps=exp_ode_steps,
         )
-                   
-    curve = build_geodesic_curve(
-        xA_,
-        xB_,
-        log_map_fn=log_map_fn,
-        exp_map_fn=exp_map_fn,
-        n_steps=n_geo_steps
+
+    def global_log_map_fn(x, y):
+        return log_map_shooting(
+            x, y, exp_map_fn,
+            max_iters=global_shooting_iters,
+            lr=global_shooting_lr,
+            tol=1e-3,
+        )
+
+    print("Building initial LINEAR interpolation in latent z_T coordinates...")
+    curve_z0 = build_linear_latent_curve(
+        z_pair_T[0:1], z_pair_T[1:2], n_steps=n_geo_points
     )
 
-    # -------------------------
-    # Refine curve and plot after each iteration
-    # -------------------------
-    curves_refined = refine_high_confidence_curve(
-        curve,
-        Phi_fn=Phi_fn,
-        log_map_fn=log_map_fn,
+    print("Running generator-constrained clean-space local Frechet refinement from latent LERP...")
+    history_z, energy_history, accepted_energy_history, step_history = refine_latent_constrained_clean_frechet(
+        curve_z0,
+        latent_to_clean_fn=latent_to_clean_fn,
+        latent_to_clean_grad_fn=latent_to_clean_grad_fn,
         exp_map_fn=exp_map_fn,
-        eps=0.2,#1.0
-        n_iters=50,
-        n_candidates=4,#16
-        conf_kwargs=dict(max_iter=20, lr=0.005)
+        model=model,
+        scheduler=scheduler,
+        proxy_t=proxy_t,
+        metric_lambda=metric_lambda,
+        sigma=sigma,
+        n_iters=refinement_iters,
+        n_candidates=n_candidates,
+        latent_step_size=latent_step_size,
+        step_decay=step_decay,
+        min_latent_step=min_latent_step,
+        local_shooting_iters=local_shooting_iters,
+        local_shooting_lr=local_shooting_lr,
+        pair_chunk_size=pair_chunk_size,
+        normalize_step=True,
+        backtracking_factor=backtracking_factor,
+        max_backtracking_steps=max_backtracking_steps,
+        energy_decrease_tol=energy_decrease_tol,
     )
-    
-    # -------------------------
-    # Plot all iterations at once
-    # -------------------------
-    plot_curve_images(
-        curves_refined,
-        Phi_fn,
-        title="High-Confidence Curve Refinement"
+
+    out_name = "Corrected_Fast_Frechet_LINEAR_INIT_BACKTRACK.png"
+    plot_initial_vs_refined(
+        curve_z0, history_z[-1], latent_to_clean_display_fn, out_name
     )
-    print("Saved high-confidence curve refinement figure with all iterations.")
+    print(f"Saved {out_name}")
+
+    history_name = "Corrected_Fast_Frechet_HISTORY_BACKTRACK.png"
+    plot_refinement_history(
+        history_z, latent_to_clean_display_fn, history_name, every=1
+    )
+    print(f"Saved {history_name}")
+
+    if energy_history:
+        print("Final pre-step local Frechet energies:", energy_history[-1].tolist())
+    if accepted_energy_history:
+        print("Final accepted local Frechet energies:", accepted_energy_history[-1].tolist())
+    if step_history:
+        print("Final accepted per-node step sizes:", step_history[-1].tolist())
+
 
 if __name__ == "__main__":
     main()
-        
