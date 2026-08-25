@@ -327,6 +327,15 @@ def levi_civita_exp_map(
 # ------------------------
 # Log map shooting
 # ------------------------
+def _endpoint_residual_stats(y_pred, y_target):
+    """Return residual, per-sample L2 endpoint error, and mean per-coordinate RMSE."""
+    residual = y_target - y_pred
+    flat = residual.flatten(1)
+    l2 = flat.norm(dim=1)
+    rmse = flat.pow(2).mean(dim=1).sqrt()
+    return residual, l2, rmse.mean()
+
+
 @torch.no_grad()
 def log_map_shooting(
     y,
@@ -335,36 +344,111 @@ def log_map_shooting(
     scheduler,
     t_idx,
     beta=1e6,
-    max_iters=24,
-    lr=0.25,
-    n_substeps_schedule=None,
-    n_exp_steps=10,
+    max_iters=240,
+    lr=0.35,
+    n_substeps_schedule=(1, 2, 4, 8, 16, 32),
+    n_exp_steps=None,
     tol=1e-3,
+    initial_v=None,
+    backtracking_factor=0.5,
+    max_backtracking_steps=5,
+    lr_growth=1.15,
+    min_lr=1e-5,
+    max_lr=None,
+    verbose=True,
 ):
+    r"""
+    Approximate Log_y(y_target) with coarse-to-fine residual shooting.
+
+    The geodesic equation itself is unchanged.  At a fixed ODE resolution S,
+    the basic shooting correction is still the paper's residual update
+
+        r <- y_target - Exp_y(v),
+        v <- v + eta r.
+
+    Numerical improvements used here:
+
+      1. Coarse-to-fine ODE continuation with n_substeps_schedule.  The tangent
+         found at one integration resolution initializes the next resolution.
+      2. Monotone backtracking on the endpoint residual.  eta is reduced when a
+         residual step does not improve the numerical endpoint match.
+      3. A supplied initial_v can warm-start the solve.  In main() we use the
+         solution for the previous lambda value to initialize the next lambda,
+         which is a continuation method in the metric parameter.
+      4. Stopping is based on per-coordinate endpoint RMSE rather than the raw
+         high-dimensional L2 norm.  Both are printed for diagnostics.
+
+    These changes improve the numerical shooting solve only; they do not alter
+    the metric or Levi-Civita ODE used by the paper.
     """
-    Approximate Log_y(y_target) by damped endpoint shooting.
-
-    This now matches the paper's Algorithm 1 much more closely:
-
-        r <- y_target - Exp_y(v)
-        v <- v + lr * r.
-
-    No global convexity or convergence claim is made.  The best endpoint
-    residual encountered is returned.
-
-    n_substeps_schedule is retained only for compatibility with the old
-    function signature and is not used by the current paper implementation.
-    """
-    del n_substeps_schedule
+    if not (0.0 < backtracking_factor < 1.0):
+        raise ValueError("backtracking_factor must lie in (0,1)")
+    if max_backtracking_steps < 1:
+        raise ValueError("max_backtracking_steps must be >= 1")
+    if lr <= 0:
+        raise ValueError("lr must be positive")
 
     y = y.detach()
     y_target = y_target.detach()
 
-    v = (y_target - y).detach().clone()
-    best_v = v.clone()
-    best_loss = float("inf")
+    # Backward compatibility: if an explicit single integration resolution is
+    # requested, use it as the one-element continuation schedule.
+    if n_substeps_schedule is None:
+        if n_exp_steps is None:
+            n_substeps_schedule = (10,)
+        else:
+            n_substeps_schedule = (int(n_exp_steps),)
+    else:
+        n_substeps_schedule = tuple(int(s) for s in n_substeps_schedule)
+        if len(n_substeps_schedule) == 0 or any(s < 1 for s in n_substeps_schedule):
+            raise ValueError("n_substeps_schedule must contain positive integers")
+        if n_exp_steps is not None and int(n_exp_steps) != n_substeps_schedule[-1]:
+            # Keep old calls meaningful: an explicitly supplied n_exp_steps is
+            # interpreted as the desired final integration resolution.
+            n_substeps_schedule = tuple(n_substeps_schedule) + (int(n_exp_steps),)
 
-    for _ in range(max_iters):
+    # Remove accidental duplicates while preserving order.
+    schedule = []
+    for s in n_substeps_schedule:
+        if not schedule or s != schedule[-1]:
+            schedule.append(s)
+    n_substeps_schedule = tuple(schedule)
+
+    if initial_v is None:
+        v = (y_target - y).detach().clone()
+    else:
+        v = initial_v.detach().clone()
+        if v.shape != y.shape:
+            raise ValueError("initial_v must have the same shape as y")
+
+    # The user-provided max_iters is the total iteration budget.  We allocate a
+    # little more of it to the finer resolutions because the final endpoint
+    # accuracy is determined there.
+    n_stages = len(n_substeps_schedule)
+    stage_weights = torch.arange(1, n_stages + 1, dtype=torch.float64)
+    raw_alloc = max_iters * stage_weights / stage_weights.sum()
+    iters_per_stage = [max(1, int(round(x.item()))) for x in raw_alloc]
+    # Correct rounding so the total remains exactly max_iters.
+    diff = int(max_iters - sum(iters_per_stage))
+    idx = n_stages - 1
+    while diff != 0:
+        if diff > 0:
+            iters_per_stage[idx] += 1
+            diff -= 1
+        elif iters_per_stage[idx] > 1:
+            iters_per_stage[idx] -= 1
+            diff += 1
+        idx = (idx - 1) % n_stages
+
+    if max_lr is None:
+        max_lr = max(float(lr), 1.0)
+
+    final_best_v = v.clone()
+    final_best_rmse = float("inf")
+    final_best_l2 = float("inf")
+
+    for stage_idx, (n_steps, stage_iters) in enumerate(zip(n_substeps_schedule, iters_per_stage)):
+        # Re-evaluate the incoming tangent at the new integration resolution.
         y_pred = levi_civita_exp_map(
             y,
             v,
@@ -372,22 +456,116 @@ def log_map_shooting(
             scheduler,
             t_idx,
             beta=beta,
-            n_steps=n_exp_steps,
+            n_steps=n_steps,
+        )
+        residual, l2, rmse = _endpoint_residual_stats(y_pred, y_target)
+
+        stage_best_v = v.clone()
+        stage_best_rmse = float(rmse.item())
+        stage_best_l2 = float(l2.mean().item())
+        eta = float(lr)
+
+        if verbose:
+            print(
+                f"    shooting stage {stage_idx + 1}/{n_stages}: "
+                f"ODE steps={n_steps}, iters={stage_iters}, "
+                f"start L2={stage_best_l2:.6g}, RMSE={stage_best_rmse:.6g}"
+            )
+
+        for _ in range(stage_iters):
+            current_rmse = float(rmse.item())
+            current_l2 = float(l2.mean().item())
+
+            if current_rmse < stage_best_rmse:
+                stage_best_rmse = current_rmse
+                stage_best_l2 = current_l2
+                stage_best_v = v.clone()
+
+            if current_rmse <= tol:
+                break
+
+            accepted = False
+            trial_eta = eta
+
+            # Residual line search.  This preserves the same shooting direction
+            # v + eta*r while preventing a large eta from destroying a good
+            # iterate as the endpoint map becomes nonlinear.
+            for _bt in range(max_backtracking_steps):
+                v_trial = v + trial_eta * residual
+
+                if not torch.isfinite(v_trial).all():
+                    trial_eta *= backtracking_factor
+                    continue
+
+                y_trial = levi_civita_exp_map(
+                    y,
+                    v_trial,
+                    model,
+                    scheduler,
+                    t_idx,
+                    beta=beta,
+                    n_steps=n_steps,
+                )
+
+                if not torch.isfinite(y_trial).all():
+                    trial_eta *= backtracking_factor
+                    continue
+
+                residual_trial, l2_trial, rmse_trial = _endpoint_residual_stats(
+                    y_trial, y_target
+                )
+                trial_rmse_value = float(rmse_trial.item())
+
+                # Strict decrease, up to tiny floating-point noise.
+                if trial_rmse_value < current_rmse - 1e-10:
+                    v = v_trial
+                    residual = residual_trial
+                    l2 = l2_trial
+                    rmse = rmse_trial
+                    eta = min(float(max_lr), trial_eta * float(lr_growth))
+                    if trial_rmse_value < stage_best_rmse:
+                        stage_best_rmse = trial_rmse_value
+                        stage_best_l2 = float(l2_trial.mean().item())
+                        stage_best_v = v_trial.clone()
+                    accepted = True
+                    break
+
+                trial_eta *= backtracking_factor
+                if trial_eta < min_lr:
+                    break
+
+            if not accepted:
+                # At a coarse discretization the residual direction can cease
+                # to improve the endpoint.  Keep the best tangent from this
+                # stage and move to the finer discretization rather than
+                # oscillating or diverging.
+                eta = max(float(min_lr), trial_eta)
+                break
+
+        # Always propagate the best tangent from this resolution, not merely the
+        # last attempted tangent.
+        v = stage_best_v.clone()
+
+        if verbose:
+            print(
+                f"      best at S={n_steps}: "
+                f"L2={stage_best_l2:.6g}, RMSE={stage_best_rmse:.6g}"
+            )
+
+        # Only the final-resolution residual should determine the returned log
+        # map.  Coarser endpoint maps are different numerical approximations.
+        if stage_idx == n_stages - 1:
+            final_best_v = stage_best_v.clone()
+            final_best_rmse = stage_best_rmse
+            final_best_l2 = stage_best_l2
+
+    if verbose:
+        print(
+            f"    final shooting residual: L2={final_best_l2:.6g}, "
+            f"RMSE={final_best_rmse:.6g}"
         )
 
-        residual = y_target - y_pred
-        loss = residual.flatten(1).pow(2).sum(dim=1).mean()
-
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            best_v = v.clone()
-
-        if torch.sqrt(loss).item() <= tol:
-            break
-
-        v = v + lr * residual
-
-    return best_v.detach()
+    return final_best_v.detach()
 
 
 # ------------------------
@@ -446,7 +624,7 @@ class CelebAHQDataset(Dataset):
 # Main
 # ------------------------
 def main():
-    device = "cpu"  # or "cuda" if available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     image_path_A = "/data5/accounts/marsh/Diffusion/celeba_hq_prepared/000100.png"  # Replace with your filepath
 
     x0_A = load_image(image_path_A).to(device)
@@ -489,12 +667,27 @@ def main():
     lambda_values = [0, 1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0]
 
     n_geo_steps = 10          # number of displayed interpolation points
-    n_exp_steps = 10          # ODE steps over unit geodesic time
-    shooting_iters = 24
-    shooting_lr = 0.25
-    shooting_tol = 1e-3
+
+    # Coarse-to-fine ODE resolutions used by endpoint shooting.  The final
+    # value is also used to render the displayed geodesic.
+    shooting_substeps = (1, 2, 4, 8, 16, 32)
+    n_exp_steps = shooting_substeps[-1]
+
+    # Total shooting budget across all substep stages.  Backtracking makes this
+    # much more stable than using one fixed residual step size.
+    shooting_iters = 240
+    shooting_lr = 0.35
+    shooting_tol = 2e-3      # per-coordinate endpoint RMSE
+
+    # Extra continuation in lambda.  A value of 1 inserts one geometric
+    # midpoint between successive positive displayed lambda values.  This costs
+    # more shooting solves, but makes the very large-lambda cases considerably
+    # easier because each solve starts from a nearby metric.
+    lambda_continuation_midpoints = 1
 
     all_geodesics = {}
+    previous_v = None        # continuation warm start across increasing lambda
+    previous_lambda = 0.0
 
     # ------------------------------------------------------------
     # Geodesics are now shot DIRECTLY from clean xA to clean xB.
@@ -503,18 +696,50 @@ def main():
     for lam in lambda_values:
         print(f"Computing geodesic for lambda={lam}...")
 
-        v_forward = log_map_shooting(
-            xA,
-            xB,
-            model,
-            scheduler,
-            t_idx,
-            beta=lam,
-            max_iters=shooting_iters,
-            lr=shooting_lr,
-            n_exp_steps=n_exp_steps,
-            tol=shooting_tol,
-        )
+        if lam == 0:
+            # For lambda=0, g=I and Exp_x(v)=x+v exactly.
+            v_forward = (xB - xA).detach().clone()
+        else:
+            # Continuation path in lambda.  The displayed values are separated
+            # by factors of ten; one or more geometric midpoint solves make the
+            # change in the endpoint map much less abrupt.
+            if previous_lambda > 0 and lambda_continuation_midpoints > 0:
+                ratio = float(lam) / float(previous_lambda)
+                solve_lambdas = [
+                    float(previous_lambda) * ratio ** (j / (lambda_continuation_midpoints + 1))
+                    for j in range(1, lambda_continuation_midpoints + 1)
+                ] + [float(lam)]
+            else:
+                solve_lambdas = [float(lam)]
+
+            v_forward = previous_v
+            for solve_lam in solve_lambdas:
+                if solve_lam != float(lam):
+                    print(f"  continuation solve at lambda={solve_lam:.6g}")
+                v_forward = log_map_shooting(
+                    xA,
+                    xB,
+                    model,
+                    scheduler,
+                    t_idx,
+                    beta=solve_lam,
+                    max_iters=shooting_iters,
+                    lr=shooting_lr,
+                    n_substeps_schedule=shooting_substeps,
+                    n_exp_steps=None,
+                    tol=shooting_tol,
+                    initial_v=v_forward,
+                    backtracking_factor=0.5,
+                    max_backtracking_steps=5,
+                    lr_growth=1.15,
+                    min_lr=1e-5,
+                    max_lr=1.0,
+                    verbose=True,
+                )
+
+        # Warm-start the next displayed lambda with the current solution.
+        previous_v = v_forward.detach().clone()
+        previous_lambda = float(lam)
 
         # Endpoint diagnostic for the numerical shooting solve.
         endpoint_pred = levi_civita_exp_map(
@@ -526,8 +751,13 @@ def main():
             beta=lam,
             n_steps=n_exp_steps,
         )
-        endpoint_error = (endpoint_pred - xB).flatten(1).norm(dim=1).mean().item()
-        print(f"  shooting endpoint error: {endpoint_error:.6g}")
+        endpoint_residual = endpoint_pred - xB
+        endpoint_l2 = endpoint_residual.flatten(1).norm(dim=1).mean().item()
+        endpoint_rmse = endpoint_residual.flatten(1).pow(2).mean(dim=1).sqrt().mean().item()
+        print(
+            f"  shooting endpoint error: L2={endpoint_l2:.6g}, "
+            f"per-coordinate RMSE={endpoint_rmse:.6g}"
+        )
 
         geodesic = []
         for i in range(n_geo_steps):
