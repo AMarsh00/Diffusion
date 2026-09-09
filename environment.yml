@@ -1,0 +1,17 @@
+name: hcc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - numpy>=1.26,<3
+      - Pillow>=10,<12
+      - matplotlib>=3.8,<4
+      - PyYAML>=6,<7
+      - scipy>=1.12,<2
+      - tqdm>=4.66,<5
+      - torchmetrics>=1.4,<2
+      - torch-fidelity>=0.3,<1
+      - lpips>=0.1.4,<1
+      - pytest>=8,<9

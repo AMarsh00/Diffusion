@@ -1,7 +1,3 @@
-"""
-Computes geodesics between random generations of the loaded diffusion model (CelebA-HQ and Animal Faces both work) with our metric for various values of lambda.
-"""
-
 import os
 import math
 import torch

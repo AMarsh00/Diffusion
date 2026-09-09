@@ -1,0 +1,46 @@
+# Paper / reproduction settings for AFHQ High-Confidence Curves.
+# These are intentionally separate from the lightweight API defaults in
+# Code/High_Confidence_Curves.py.
+seed: 0
+image_size: 64
+num_timesteps: 1000
+proxy_t: 400
+metric_lambda: 1.0e6
+exp_ode_steps: 6
+local_shooting_iters: 3
+local_shooting_lr: 0.5
+n_geo_points: 10
+inversion_steps: 1000
+refine_decode_steps: 100
+display_decode_steps: 1000
+sigma: 0.20
+n_candidates: 16
+refinement_iters: 50
+latent_step_size: 0.18
+step_decay: 0.80
+min_latent_step: 0.035
+pair_chunk_size: 16
+normalize_step: true
+backtracking_factor: 0.5
+max_backtracking_steps: 4
+energy_decrease_tol: 0.0
+checkpoint: "Model/Model Weights/unet_animal_epoch_2000.pt"
+
+# Diagnostic defaults.
+diagnostics:
+  exp_step_values: [6, 12, 24, 48]
+  shooting_iters: 8
+  shooting_lr: 0.4
+  shooting_tol: 0.001
+  num_pairs: 16
+
+# The current repository's original broad score-force NEB sweep. Override on the
+# command line for a smaller paper figure if desired.
+neb:
+  n_iters: 500
+  proxy_t: 400
+  n_curve_points: 10
+  lr_values: [1.0e-5, 5.0e-5, 1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3, 1.0e-2, 5.0e-2, 1.0e-1, 5.0e-1, 1.0]
+  k_values: [0.0, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0]
+  reparam_every: 5
+  convergence_tol: 0.0

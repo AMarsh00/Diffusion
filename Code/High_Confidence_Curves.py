@@ -1,9 +1,5 @@
 """
-High-Confidence Curves -- paper-consistent Route-2 implementation.
-
-This file intentionally preserves the finite-sample HCC behavior that produced
-the earlier image results while targeting the SAME localized measure used in
-the manuscript.
+High-Confidence Curves
 
 Geometry
 --------
@@ -33,7 +29,7 @@ with mu=N(0,I).  Equivalently,
       = N(z0/(1+sigma^2), sigma^2/(1+sigma^2) I).
 
 Although this law can be sampled directly, the production HCC code below uses
-the ORIGINAL proposal
+the proposal
 
     q_{z0,sigma} = N(z0, sigma^2 I)
 
@@ -345,7 +341,7 @@ def geodesic_acceleration_proxy(x, v, model, scheduler, proxy_t, metric_lambda):
 
     This equals the exact Levi-Civita acceleration only when D s_tilde is
     symmetric.  For the learned image model it is used deliberately as the
-    stable Route-2 surrogate flow, not as a claim that Eq. (7) is being
+    stable surrogate flow, not as a claim that Eq. (7) is being
     integrated.
     """
     s, jv = score_proxy_and_jvp(x, v, model, scheduler, proxy_t)
@@ -433,13 +429,13 @@ def sample_local_proposal_with_importance_weights(
         q_{z0,sigma}(z) = N(z0, sigma^2 I).
 
     We define the localized target measure
-        nu_{z0,sigma}(dz) ∝ K_sigma(z,z0) mu(dz),
+        nu_{z0,sigma}(dz) ? K_sigma(z,z0) mu(dz),
     where mu=N(0,I) and
         K_sigma(z,z0) = exp(-||z-z0||^2/(2 sigma^2)).
 
     Since q is proportional to K_sigma as a density in z, self-normalized
     importance sampling from q has weights
-        w_i ∝ mu(z_i) ∝ exp(-||z_i||^2/2).
+        w_i ? mu(z_i) ? exp(-||z_i||^2/2).
 
     This preserves the finite-sample behavior of the original code while giving
     the weighting a correct importance-sampling interpretation.  The weights do
@@ -476,7 +472,7 @@ def sample_localized_measure_direct(
     sigma: float,
     antithetic: bool = False,
 ):
-    r"""
+    """
     Direct sampler for the SAME theoretical localized measure used above:
 
         nu_{z0,sigma}
@@ -533,7 +529,7 @@ def evaluate_fixed_local_frechet_energy(
     local_shooting_lr=0.5,
     pair_chunk_size=16,
 ):
-    r"""
+    """
     Evaluate the SAME fixed empirical local Frechet objective used by a line-search
     step:
 
@@ -584,7 +580,7 @@ def local_frechet_direction_clean(
     local_shooting_lr=0.5,
     pair_chunk_size=16,
 ):
-    r"""
+    """
     Compute one importance-sampled local surrogate-Frechet direction in clean
     coordinates.
 
@@ -613,9 +609,9 @@ def local_frechet_direction_clean(
 
         F_i(x) = sum_j w_ij d_g(x,Y_ij)^2.
 
-    In the exact Riemannian construction, the corresponding Fréchet gradient
+    In the exact Riemannian construction, the corresponding Frechet gradient
     uses exact logarithms.  Here those logarithms are replaced by the Eq. (8)
-    surrogate shooting directions.  Thus delta_x is a Fréchet-motivated
+    surrogate shooting directions.  Thus delta_x is a Frechet-motivated
     numerical direction.  The implementation does not rely on it being the
     exact Riemannian gradient: accepted updates are checked by backtracking on
     the same frozen surrogate objective used to construct the direction.
@@ -674,14 +670,6 @@ def local_frechet_direction_clean(
 def build_geodesic_curve(xA, xB, log_map_fn, exp_map_fn, n_steps=10):
     """
     Build the ambient Eq. (8) surrogate shooting path.
-
-    This is called `build_geodesic_curve` for backwards compatibility, but in
-    Route-2 terminology it is a surrogate geometric path rather than a claim of
-    exact Eq. (7) geodesic integration.  The shooting solve is numerical, so the
-    surrogate Exp(Log(y)) need not land exactly on y.
-    We therefore pin the two boundary values explicitly.  This does not alter the
-    interior shooting trajectory and guarantees that the interpolation has the
-    requested endpoints.
     """
     v = log_map_fn(xA, xB)
     alphas = torch.linspace(0.0, 1.0, n_steps, device=xA.device, dtype=xA.dtype)
@@ -716,8 +704,8 @@ def refine_latent_constrained_clean_frechet(
     max_backtracking_steps=4,
     energy_decrease_tol=0.0,
 ):
-    r"""
-    Generator-constrained projected local Fréchet-motivated refinement with
+    """
+    Generator-constrained projected local Frechet-motivated refinement with
     per-node backtracking.
 
     At outer iteration k, for each interior latent node z_i:
@@ -725,7 +713,7 @@ def refine_latent_constrained_clean_frechet(
       1. Decode x_i = Phi(z_i).
       2. Draw ONE local Monte Carlo candidate set {Z_ij}, decode Y_ij=Phi(Z_ij),
          and compute fixed normalized importance weights w_ij.
-      3. Form the importance-sampled surrogate Fréchet direction
+      3. Form the importance-sampled surrogate Frechet direction
 
              delta_i = sum_j w_ij Log_{x_i}(Y_ij).
 
@@ -737,14 +725,14 @@ def refine_latent_constrained_clean_frechet(
 
              grad_z F_i(z_i) = -2 D Phi(z_i)^T g(x_i) delta_i.
 
-         With exact Riemannian logarithms this is the Fréchet descent
+         With exact Riemannian logarithms this is the Frechet descent
          direction.  With the Eq. (8) surrogate logs used here, it is treated as
          a proposal direction and validated numerically by the frozen-objective
          backtracking step below.
 
       5. Project d_i orthogonally to the discrete latent-curve tangent.  Since
          orthogonal projection suppresses tangential motion.  In the exact
-         Fréchet case this preserves descent in the normal subspace; in the
+         Frechet case this preserves descent in the normal subspace; in the
          implemented surrogate case acceptance is determined by backtracking.
 
       6. Normalize the projected direction and use its scheduled norm as a
@@ -959,8 +947,7 @@ def load_image(path, image_size=64):
 def plot_initial_vs_refined(initial_z, refined_z, latent_to_clean_fn, filename):
     """
     Plot the initial latent linear interpolation versus the final refined curve.
-    Both rows are decoded through Phi, so the comparison is generator-constrained
-    and apples-to-apples.
+    Both rows are decoded through Phi, so the comparison is fair
     """
     pair = torch.cat([initial_z, refined_z], dim=0)
     decoded = latent_to_clean_fn(pair)
