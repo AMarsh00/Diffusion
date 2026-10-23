@@ -192,10 +192,6 @@ The included tests check that:
 - accepted frozen-objective updates do not increase the tested local objective,
 - missing checkpoints fail loudly rather than running random weights.
 
-## Reproducibility policy
-
-For a paper result, save the generated JSON file together with the figure. The JSON contains the configuration and numerical diagnostics needed to identify the exact run. For a submission release, tag the repository commit used to generate the final manuscript figures.
-
 ## Terminology
 
 - **Exact metric:** `g(x) = I + lambda s_tilde(x) s_tilde(x)^T`.
